@@ -76,6 +76,8 @@ async function apiPost(path, params={}) {
 }
 
 // ── BALANCE ──
+let freeUSDT = 0;
+
 async function fetchTotalBalance() {
   try {
     const ts = Date.now();
@@ -85,10 +87,11 @@ async function fetchTotalBalance() {
       headers:{'X-MBX-APIKEY':API_KEY}, timeout:8000
     });
     let total = 0;
+    let usdt = 0;
     for (const b of r.data.balances) {
       const qty = parseFloat(b.free) + parseFloat(b.locked);
       if (qty <= 0) continue;
-      if (b.asset === 'USDT') { total += qty; continue; }
+      if (b.asset === 'USDT') { total += qty; usdt = parseFloat(b.free); continue; }
       if (['BRL','EUR','GBP'].includes(b.asset)) continue;
       try {
         const p = await getPrice(b.asset+'USDT');
@@ -96,7 +99,8 @@ async function fetchTotalBalance() {
       } catch(e) {}
     }
     totalBalance = total;
-    log(`Saldo total: $${totalBalance.toFixed(2)}`);
+    freeUSDT = usdt;
+    log(`Saldo total: $${totalBalance.toFixed(2)} | USDT livre: $${freeUSDT.toFixed(2)}`);
   } catch(e) {
     log(`Erro saldo: ${e.message}`);
   }
@@ -156,6 +160,12 @@ async function execBuy(symbol, usdtAmt, type) {
 
   if (!qty || qty <= 0 || isNaN(qty)) return null;
 
+  // Check free USDT before buying
+  if (!PAPER_MODE && freeUSDT < usdtAmt) {
+    log(`[${type}] USDT insuficiente: $${freeUSDT.toFixed(2)} < $${usdtAmt.toFixed(2)} — pulando ${symbol}`);
+    return null;
+  }
+
   log(`[${type}][${PAPER_MODE?'SIM':'REAL'}] BUY ${qty} ${symbol} @ $${price.toFixed(4)} (~$${usdtAmt.toFixed(2)})`);
 
   if (!PAPER_MODE) {
@@ -168,6 +178,7 @@ async function execBuy(symbol, usdtAmt, type) {
   }
 
   tradeCount++;
+  freeUSDT -= usdtAmt; // deduct locally until next balance fetch
   await notify(`capital. — [${type}] Compra!`, `${qty} ${symbol.replace('USDT','')} @ $${price.toFixed(4)} (~$${usdtAmt.toFixed(2)})`);
   return { entryPrice:price, qty, usdt:usdtAmt, ts:Date.now() };
 }
@@ -197,8 +208,11 @@ async function execSell(symbol, pos, reason, type) {
 // ── STRATEGY 1: HOLD ──
 async function runHold() {
   if (totalBalance <= 0) return;
-  const holdAmt = (totalBalance * HOLD_PCT) / HOLD_ASSETS.length;
-  if (holdAmt < 5) { log(`Hold amount baixo: $${holdAmt.toFixed(2)}`); return; }
+  // Use totalBalance if enough USDT, otherwise use freeUSDT
+  const idealHoldAmt = (totalBalance * HOLD_PCT) / HOLD_ASSETS.length;
+  const holdAmt = freeUSDT >= idealHoldAmt ? idealHoldAmt : (freeUSDT * HOLD_PCT) / HOLD_ASSETS.length;
+  if (holdAmt < 1) { log(`Hold amount baixo: $${holdAmt.toFixed(2)} | USDT livre: $${freeUSDT.toFixed(2)}`); return; }
+  log(`[HOLD] Usando $${holdAmt.toFixed(2)} por ativo (USDT livre: $${freeUSDT.toFixed(2)}, ideal: $${idealHoldAmt.toFixed(2)})`);
 
   // Buy missing holds
   for (const asset of HOLD_ASSETS) {
@@ -233,8 +247,9 @@ async function runHold() {
 // ── STRATEGY 2: SCALP ──
 async function runScalp() {
   if (totalBalance <= 0) return;
-  const scalpCap   = totalBalance * SCALP_PCT;
-  const perTrade   = Math.max(5, scalpCap * SCALP_TRADE_PCT);
+  const idealScalpCap = totalBalance * SCALP_PCT;
+  const scalpCap   = freeUSDT >= idealScalpCap ? idealScalpCap : freeUSDT * SCALP_PCT;
+  const perTrade   = Math.max(1, scalpCap * SCALP_TRADE_PCT);
   const scalpInUse = Object.values(scalpPositions).reduce((s,p)=>s+p.usdt,0);
 
   // Manage open positions
@@ -252,6 +267,7 @@ async function runScalp() {
   }
 
   if (Object.keys(scalpPositions).length >= 5) return;
+  if (freeUSDT <= 1) return;
   if (scalpInUse >= scalpCap) return;
 
   // Scan for buys
@@ -307,8 +323,9 @@ async function fetchSentiment(coin) {
 
 async function runSentiment() {
   if (totalBalance <= 0) return;
-  const sentCap  = totalBalance * SENT_PCT;
-  const perTrade = Math.max(5, sentCap * SENT_TRADE_PCT);
+  const idealSentCap = totalBalance * SENT_PCT;
+  const sentCap  = freeUSDT >= idealSentCap ? idealSentCap : freeUSDT * SENT_PCT;
+  const perTrade = Math.max(1, sentCap * SENT_TRADE_PCT);
   const sentInUse = Object.values(sentPositions).reduce((s,p)=>s+p.usdt,0);
 
   // Manage open
@@ -322,6 +339,7 @@ async function runSentiment() {
   }
 
   if (Object.keys(sentPositions).length >= 2) return;
+  if (freeUSDT <= 1) return;
   if (sentInUse >= sentCap) return;
 
   // Pick one coin to analyze per cycle
@@ -393,9 +411,10 @@ const server = http.createServer(async (req, res) => {
     pnl:`$${totalPnL.toFixed(2)}`, tradeCount, paused, lastCycle,
     capital:{
       total:`$${totalBalance.toFixed(2)}`,
-      holdAlloc:`$${(totalBalance*HOLD_PCT).toFixed(2)} (50%)`,
-      scalpAlloc:`$${(totalBalance*SCALP_PCT).toFixed(2)} (35%)`,
-      sentAlloc:`$${(totalBalance*SENT_PCT).toFixed(2)} (15%)`,
+      freeUSDT:`$${freeUSDT.toFixed(2)}`,
+      holdAlloc:`$${(totalBalance*HOLD_PCT).toFixed(2)} ideal | $${(freeUSDT*HOLD_PCT).toFixed(2)} disponivel (50%)`,
+      scalpAlloc:`$${(totalBalance*SCALP_PCT).toFixed(2)} ideal | $${(freeUSDT*SCALP_PCT).toFixed(2)} disponivel (35%)`,
+      sentAlloc:`$${(totalBalance*SENT_PCT).toFixed(2)} ideal | $${(freeUSDT*SENT_PCT).toFixed(2)} disponivel (15%)`,
       holdInUse:`$${holdInUse.toFixed(2)}`,
       scalpInUse:`$${scalpInUse.toFixed(2)}`,
       sentInUse:`$${sentInUse.toFixed(2)}`,
