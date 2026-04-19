@@ -250,7 +250,43 @@ async function runBot() {
 setInterval(runBot, 30000);
 
 // HTTP server
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
+  res.setHeader('Content-Type', 'application/json');
+  
+  if (req.method === 'POST' && req.url === '/force-buy') {
+    // Force buy smallest amount of DOGE for testing
+    try {
+      const price = await getPrice('DOGEUSDT');
+      if (!price) { res.writeHead(500); res.end(JSON.stringify({error:'price fetch failed'})); return; }
+      // Buy minimum $5 worth
+      const usdtAmount = 5;
+      let qty = usdtAmount / price;
+      qty = parseFloat(qty.toFixed(0)); // DOGE uses whole numbers
+      if (qty < 1) qty = 1;
+      log(`[FORCE-BUY] Comprando ${qty} DOGE @ $${price} (~$${usdtAmount})`);
+      if (!PAPER_MODE) {
+        await apiPost('/api/v3/order', { symbol: 'DOGEUSDT', side: 'BUY', type: 'MARKET', quantity: qty });
+      }
+      positions['DOGEUSDT_TEST'] = { entryPrice: price, qty, usdt: usdtAmount, profile: 'aggressive' };
+      tradeCount++;
+      await notify('capital. — Compra TESTE!', `${qty} DOGE @ $${price.toFixed(4)} (~$${usdtAmount})`);
+      res.writeHead(200);
+      res.end(JSON.stringify({ success: true, symbol: 'DOGEUSDT', qty, price, usdtAmount, mode: PAPER_MODE ? 'simulado' : 'real' }));
+    } catch(e) {
+      log(`Force buy error: ${e.message}`);
+      res.writeHead(500);
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  if (req.method === 'POST' && req.url === '/pause') {
+    paused = !paused;
+    res.writeHead(200);
+    res.end(JSON.stringify({ paused }));
+    return;
+  }
+
   const status = {
     status: 'online',
     mode: PAPER_MODE ? 'simulado' : 'real',
@@ -266,7 +302,7 @@ const server = http.createServer((req, res) => {
       available: CAPITAL_TOTAL - Object.values(positions).reduce((s,p)=>s+p.usdt, 0)
     }
   };
-  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.writeHead(200);
   res.end(JSON.stringify(status));
 });
 
