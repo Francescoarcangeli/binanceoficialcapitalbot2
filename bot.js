@@ -61,7 +61,7 @@ function getScalpCapital()  { return liveBalance * SCALP_PCT; }
 function getSentCapital()   { return liveBalance * SENTIMENT_PCT; }
 function getScalpTradeAmt() { return Math.max(5, getScalpCapital() * SCALP_TRADE_PCT); }
 function getSentTradeAmt()  { return Math.max(5, getSentCapital() * SENT_TRADE_PCT); }
-function getHoldTradeAmt()  { return getHoldCapital() / 3; }
+function getHoldTradeAmt()  { const v = getHoldCapital() / 3; return (!v || isNaN(v)) ? 0 : v; }
 function getPauseLoss()     { return liveBalance * PAUSE_LOSS_PCT; }
 function getPauseProfit()   { return liveBalance * PAUSE_PROFIT_PCT; }
 
@@ -164,13 +164,17 @@ async function get1hChange(symbol) {
 async function execBuy(symbol, usdtAmount, type) {
   const price = await getPrice(symbol);
   if (!price) return null;
+  if (!usdtAmount || isNaN(usdtAmount) || usdtAmount <= 0) {
+    log(`[${type}] Valor invalido: ${usdtAmount} — aguardando saldo`);
+    return null;
+  }
   let qty = usdtAmount / price;
 
   // Round based on price magnitude
   if (price > 1000) qty = parseFloat(qty.toFixed(5));
   else if (price > 1) qty = parseFloat(qty.toFixed(2));
   else qty = parseFloat(qty.toFixed(0));
-  if (qty <= 0) return null;
+  if (!qty || isNaN(qty) || qty <= 0) return null;
 
   log(`[${type.toUpperCase()}][${PAPER_MODE?'SIM':'REAL'}] BUY ${qty} ${symbol} @ $${price.toFixed(6)} (~$${usdtAmount})`);
 
@@ -213,8 +217,10 @@ async function execSell(symbol, pos, reason, type) {
 // STRATEGY 1 — LONG TERM HOLD
 // ══════════════════════════════════════
 async function initHolds() {
-  const holdUSDT = Object.values(holdPositions).reduce((s,p)=>s+p.usdt, 0);
   if (Object.keys(holdPositions).length >= HOLD_ASSETS.length) return;
+  if (!liveBalance || liveBalance <= 0) { log('Aguardando saldo para iniciar holds...'); return; }
+  const holdAmt = getHoldTradeAmt();
+  if (!holdAmt || holdAmt < 5) { log(`Hold amount muito baixo: $${holdAmt} — aguardando mais saldo`); return; }
   log('=== Verificando posicoes HOLD ===');
   for (const asset of HOLD_ASSETS) {
     if (!holdPositions[asset.symbol]) {
