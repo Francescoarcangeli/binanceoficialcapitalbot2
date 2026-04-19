@@ -31,14 +31,27 @@ async function fetchBalance() {
     const res = await axios.get(`${BASE_URL}/api/v3/account?${qstr}&signature=${sig}`, {
       headers: { 'X-MBX-APIKEY': API_KEY }, timeout: 8000
     });
-    const usdt = res.data.balances.find(b => b.asset === 'USDT');
-    if (usdt) {
-      liveBalance = parseFloat(usdt.free);
-      log(`Saldo USDT: $${liveBalance.toFixed(2)}`);
+
+    const balances = res.data.balances.filter(b => parseFloat(b.free) > 0 || parseFloat(b.locked) > 0);
+    
+    // Get prices for all non-USDT assets
+    let totalUSD = 0;
+    for (const b of balances) {
+      const qty = parseFloat(b.free) + parseFloat(b.locked);
+      if (qty <= 0) continue;
+      if (b.asset === 'USDT') { totalUSD += qty; continue; }
+      if (b.asset === 'BRL' || b.asset === 'EUR') continue;
+      try {
+        const price = await getPrice(b.asset + 'USDT');
+        if (price) totalUSD += qty * price;
+      } catch(e) {}
     }
+
+    liveBalance = totalUSD;
+    log(`Saldo total da conta: $${liveBalance.toFixed(2)} (todas as cryptos + USDT)`);
   } catch(e) {
     log(`Erro ao buscar saldo: ${e.message}`);
-    if (liveBalance === 0) liveBalance = 300; // fallback
+    if (liveBalance === 0) liveBalance = 100;
   }
   return liveBalance;
 }
