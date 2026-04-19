@@ -97,7 +97,7 @@ let paused            = false;
 let tradeCount        = 0;
 let lastCycle         = null;
 let sentimentCache    = {}; // cache news sentiment per symbol
-let holdInitialized   = false;
+
 
 // ══════════════════════════════════════
 // UTILS
@@ -213,8 +213,9 @@ async function execSell(symbol, pos, reason, type) {
 // STRATEGY 1 — LONG TERM HOLD
 // ══════════════════════════════════════
 async function initHolds() {
-  if (holdInitialized) return;
-  log('=== Iniciando posicoes HOLD de longo prazo ===');
+  const holdUSDT = Object.values(holdPositions).reduce((s,p)=>s+p.usdt, 0);
+  if (Object.keys(holdPositions).length >= HOLD_ASSETS.length) return;
+  log('=== Verificando posicoes HOLD ===');
   for (const asset of HOLD_ASSETS) {
     if (!holdPositions[asset.symbol]) {
       const pos = await execBuy(asset.symbol, asset.allocation, 'HOLD');
@@ -228,8 +229,7 @@ async function initHolds() {
       }
     }
   }
-  holdInitialized = true;
-  log('Holds iniciados: ' + Object.keys(holdPositions).join(', '));
+  if(Object.keys(holdPositions).length > 0) log('Holds ativos: ' + Object.keys(holdPositions).join(', '));
 }
 
 async function manageHolds() {
@@ -421,9 +421,9 @@ async function runBot() {
 
   log(`=== Ciclo | PnL:$${totalPnL.toFixed(2)} | Trades:${tradeCount} | InUse:$${totalInUse.toFixed(0)} | Hold:${Object.keys(holdPositions).length} Scalp:${Object.keys(scalpPositions).length} Sent:${Object.keys(sentimentPositions).length} ===`);
 
-  // Init holds first time
-  if (!holdInitialized) await initHolds();
-  else await manageHolds();
+  // Always ensure holds are initialized
+  await initHolds();
+  await manageHolds();
 
   // Run scalping and sentiment in parallel
   await Promise.all([runScalping(), runSentiment()]);
@@ -437,6 +437,14 @@ setInterval(runBot, 15000);
 // ══════════════════════════════════════
 const server = http.createServer(async (req, res) => {
   res.setHeader('Content-Type', 'application/json');
+
+  if (req.method === 'POST' && req.url === '/force-hold') {
+    holdPositions = {};
+    await initHolds();
+    res.writeHead(200);
+    res.end(JSON.stringify({ success: true, holds: holdPositions }));
+    return;
+  }
 
   if (req.method === 'POST' && req.url === '/pause') {
     paused = !paused;
