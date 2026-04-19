@@ -147,10 +147,12 @@ async function execBuy(symbol, usdtAmt, type) {
   if (!price || price <= 0) return null;
 
   let qty = usdtAmt / price;
-  if (price > 10000) qty = parseFloat(qty.toFixed(6));
-  else if (price > 100) qty = parseFloat(qty.toFixed(4));
-  else if (price > 1)   qty = parseFloat(qty.toFixed(2));
-  else                  qty = parseFloat(qty.toFixed(0));
+  // Binance LOT_SIZE rules
+  if (price > 50000) qty = parseFloat(qty.toFixed(5));      // BTC
+  else if (price > 1000) qty = parseFloat(qty.toFixed(4));  // ETH
+  else if (price > 10)   qty = parseFloat(qty.toFixed(2));  // SOL, BNB, AVAX
+  else if (price > 1)    qty = parseFloat(qty.toFixed(1));  // XRP, ADA, LINK
+  else                   qty = parseFloat(qty.toFixed(0));  // DOGE, MATIC
 
   if (!qty || qty <= 0 || isNaN(qty)) return null;
 
