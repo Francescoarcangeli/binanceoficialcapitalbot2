@@ -2,6 +2,7 @@ const http = require('http');
 const axios = require('axios');
 const crypto = require('crypto');
 
+// ── CONFIG ──
 const API_KEY    = process.env.BINANCE_API_KEY    || '';
 const API_SECRET = process.env.BINANCE_API_SECRET || '';
 const PAPER_MODE = process.env.PAPER_MODE !== 'false';
@@ -10,502 +11,400 @@ const NEWS_KEY   = process.env.NEWS_KEY || '8c729e78ee7e477295c572995346f88f';
 const PORT       = process.env.PORT || 3000;
 const BASE_URL   = 'https://api.binance.com';
 
-// ══════════════════════════════════════
-// CAPITAL ALLOCATION — % do saldo real
-// ══════════════════════════════════════
-const HOLD_PCT        = 0.50; // 50% do saldo para hold
-const SCALP_PCT       = 0.35; // 35% do saldo para scalp
-const SENTIMENT_PCT   = 0.15; // 15% do saldo para sentimento
-const SCALP_TRADE_PCT = 0.08; // cada trade scalp = 8% do capital scalp
-const SENT_TRADE_PCT  = 0.15; // cada trade sentimento = 15% do capital sentimento
-const PAUSE_LOSS_PCT  = 0.20; // pausa se perder 20%
-const PAUSE_PROFIT_PCT= 0.65; // pausa se lucrar 65%
+// ── ALLOCATION % ──
+const HOLD_PCT         = 0.50;
+const SCALP_PCT        = 0.35;
+const SENT_PCT         = 0.15;
+const SCALP_TRADE_PCT  = 0.08;
+const SENT_TRADE_PCT   = 0.15;
+const HOLD_STOP_PCT    = 0.25;
+const HOLD_TP_PCT      = 0.40;
+const SCALP_TP_PCT     = 0.015;
+const SCALP_SL_PCT     = 0.015;
+const SENT_TP_PCT      = 0.05;
+const SENT_SL_PCT      = 0.03;
+const PAUSE_LOSS_PCT   = 0.20;
+const PAUSE_PROFIT_PCT = 0.65;
 
-let liveBalance = 0; // saldo USDT real da conta Binance
-
-async function fetchBalance() {
-  try {
-    const ts = Date.now();
-    const qstr = `timestamp=${ts}`;
-    const sig = crypto.createHmac('sha256', API_SECRET).update(qstr).digest('hex');
-    const res = await axios.get(`${BASE_URL}/api/v3/account?${qstr}&signature=${sig}`, {
-      headers: { 'X-MBX-APIKEY': API_KEY }, timeout: 8000
-    });
-
-    const balances = res.data.balances.filter(b => parseFloat(b.free) > 0 || parseFloat(b.locked) > 0);
-    
-    // Get prices for all non-USDT assets
-    let totalUSD = 0;
-    for (const b of balances) {
-      const qty = parseFloat(b.free) + parseFloat(b.locked);
-      if (qty <= 0) continue;
-      if (b.asset === 'USDT') { totalUSD += qty; continue; }
-      if (b.asset === 'BRL' || b.asset === 'EUR') continue;
-      try {
-        const price = await getPrice(b.asset + 'USDT');
-        if (price) totalUSD += qty * price;
-      } catch(e) {}
-    }
-
-    liveBalance = totalUSD;
-    log(`Saldo total da conta: $${liveBalance.toFixed(2)} (todas as cryptos + USDT)`);
-  } catch(e) {
-    log(`Erro ao buscar saldo: ${e.message}`);
-    if (liveBalance === 0) liveBalance = 100;
-  }
-  return liveBalance;
-}
-
-function getHoldCapital()   { return (liveBalance || 0) * HOLD_PCT; }
-function getScalpCapital()  { return (liveBalance || 0) * SCALP_PCT; }
-function getSentCapital()   { return (liveBalance || 0) * SENTIMENT_PCT; }
-function getScalpTradeAmt() { const v = getScalpCapital() * SCALP_TRADE_PCT; return Math.max(5, isNaN(v) ? 5 : v); }
-function getSentTradeAmt()  { const v = getSentCapital() * SENT_TRADE_PCT; return Math.max(5, isNaN(v) ? 5 : v); }
-function getHoldTradeAmt()  { const v = getHoldCapital() / 3; return (!v || isNaN(v) || v < 5) ? 0 : v; }
-function getPauseLoss()     { return (liveBalance || 0) * PAUSE_LOSS_PCT; }
-function getPauseProfit()   { return (liveBalance || 0) * PAUSE_PROFIT_PCT; }
-
-// ══════════════════════════════════════
-// ASSETS
-// ══════════════════════════════════════
+// ── ASSETS ──
 const HOLD_ASSETS = [
-  { symbol: 'BTCUSDT', name: 'Bitcoin',  reason: 'Reserva de valor, halving 2024, ETFs institucionais' },
-  { symbol: 'ETHUSDT', name: 'Ethereum', reason: 'Staking, DeFi, smart contracts líder' },
-  { symbol: 'SOLUSDT', name: 'Solana',   reason: 'Alta velocidade, crescimento de apps e NFTs' },
+  { symbol: 'BTCUSDT', name: 'Bitcoin'  },
+  { symbol: 'ETHUSDT', name: 'Ethereum' },
+  { symbol: 'SOLUSDT', name: 'Solana'   },
 ];
-
 const SCALP_ASSETS = [
-  { symbol: 'DOGEUSDT',  name: 'Dogecoin'  },
-  { symbol: 'XRPUSDT',   name: 'XRP'       },
-  { symbol: 'ADAUSDT',   name: 'Cardano'   },
-  { symbol: 'BNBUSDT',   name: 'BNB'       },
-  { symbol: 'AVAXUSDT',  name: 'Avalanche' },
-  { symbol: 'MATICUSDT', name: 'Polygon'   },
-  { symbol: 'LINKUSDT',  name: 'Chainlink' },
-  { symbol: 'DOTUSDT',   name: 'Polkadot'  },
-  { symbol: 'UNIUSDT',   name: 'Uniswap'   },
+  'DOGEUSDT','XRPUSDT','ADAUSDT','BNBUSDT',
+  'AVAXUSDT','MATICUSDT','LINKUSDT','DOTUSDT','UNIUSDT'
 ];
+const SENT_COINS = {
+  'Bitcoin':'BTCUSDT','Ethereum':'ETHUSDT',
+  'Solana':'SOLUSDT','XRP':'XRPUSDT','Dogecoin':'DOGEUSDT'
+};
 
-// ══════════════════════════════════════
-// STATE
-// ══════════════════════════════════════
-let holdPositions     = {}; // long-term holds
-let scalpPositions    = {}; // scalp trades
-let sentimentPositions = {}; // sentiment trades
-let totalPnL          = 0;
-let paused            = false;
-let tradeCount        = 0;
-let lastCycle         = null;
-let sentimentCache    = {}; // cache news sentiment per symbol
+// ── STATE ──
+let totalBalance    = 0;
+let holdPositions   = {};
+let scalpPositions  = {};
+let sentPositions   = {};
+let sentCache       = {};
+let totalPnL        = 0;
+let tradeCount      = 0;
+let paused          = false;
+let lastCycle       = null;
 
-
-// ══════════════════════════════════════
-// UTILS
-// ══════════════════════════════════════
-function log(msg) {
-  const ts = new Date().toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' });
-  console.log(`[${ts}] ${msg}`);
-}
+// ── UTILS ──
+const log = msg => console.log(`[${new Date().toLocaleString('pt-BR',{timeZone:'America/Sao_Paulo'})}] ${msg}`);
 
 async function notify(title, body) {
   if (!NOTIFY_URL) return;
-  try { await axios.post(NOTIFY_URL + '/test-send', { title, body }, { timeout: 5000 }); } catch(e) {}
+  try { await axios.post(NOTIFY_URL+'/test-send', {title,body}, {timeout:5000}); } catch(e){}
 }
 
-async function apiGet(path, params = {}) {
-  const res = await axios.get(BASE_URL + path, { params, timeout: 8000 });
-  return res.data;
+async function apiGet(path, params={}) {
+  const r = await axios.get(BASE_URL+path, {params, timeout:8000});
+  return r.data;
 }
 
-async function apiPost(path, params = {}) {
+async function apiPost(path, params={}) {
   const ts = Date.now();
-  const qstr = Object.entries({ ...params, timestamp: ts }).map(([k,v]) => `${k}=${v}`).join('&');
-  const sig = crypto.createHmac('sha256', API_SECRET).update(qstr).digest('hex');
-  const res = await axios.post(`${BASE_URL}${path}?${qstr}&signature=${sig}`, null, {
-    headers: { 'X-MBX-APIKEY': API_KEY }, timeout: 8000
+  const q = Object.entries({...params, timestamp:ts}).map(([k,v])=>`${k}=${v}`).join('&');
+  const sig = crypto.createHmac('sha256', API_SECRET).update(q).digest('hex');
+  const r = await axios.post(`${BASE_URL}${path}?${q}&signature=${sig}`, null, {
+    headers:{'X-MBX-APIKEY':API_KEY}, timeout:8000
   });
-  return res.data;
+  return r.data;
 }
 
-function calcRSI(prices, period = 14) {
-  if (prices.length < period + 1) return 50;
-  let gains = 0, losses = 0;
-  for (let i = prices.length - period; i < prices.length; i++) {
-    const diff = prices[i] - prices[i - 1];
-    if (diff > 0) gains += diff; else losses += Math.abs(diff);
-  }
-  const rs = (gains / period) / ((losses / period) || 0.001);
-  return 100 - (100 / (1 + rs));
-}
-
-async function getKlines(symbol, interval = '5m', limit = 30) {
+// ── BALANCE ──
+async function fetchTotalBalance() {
   try {
-    const data = await apiGet('/api/v3/klines', { symbol, interval, limit });
-    return data.map(k => parseFloat(k[4]));
-  } catch(e) { return []; }
+    const ts = Date.now();
+    const q = `timestamp=${ts}`;
+    const sig = crypto.createHmac('sha256', API_SECRET).update(q).digest('hex');
+    const r = await axios.get(`${BASE_URL}/api/v3/account?${q}&signature=${sig}`, {
+      headers:{'X-MBX-APIKEY':API_KEY}, timeout:8000
+    });
+    let total = 0;
+    for (const b of r.data.balances) {
+      const qty = parseFloat(b.free) + parseFloat(b.locked);
+      if (qty <= 0) continue;
+      if (b.asset === 'USDT') { total += qty; continue; }
+      if (['BRL','EUR','GBP'].includes(b.asset)) continue;
+      try {
+        const p = await getPrice(b.asset+'USDT');
+        if (p && p > 0) total += qty * p;
+      } catch(e) {}
+    }
+    totalBalance = total;
+    log(`Saldo total: $${totalBalance.toFixed(2)}`);
+  } catch(e) {
+    log(`Erro saldo: ${e.message}`);
+  }
 }
 
+// ── PRICE / KLINES ──
 async function getPrice(symbol) {
   try {
-    const data = await apiGet('/api/v3/ticker/price', { symbol });
-    return parseFloat(data.price);
+    const d = await apiGet('/api/v3/ticker/price', {symbol});
+    return parseFloat(d.price);
   } catch(e) { return null; }
+}
+
+async function getKlines(symbol, interval='5m', limit=20) {
+  try {
+    const d = await apiGet('/api/v3/klines', {symbol, interval, limit});
+    return d.map(k => parseFloat(k[4]));
+  } catch(e) { return []; }
 }
 
 async function get1hChange(symbol) {
   try {
-    const data = await apiGet('/api/v3/klines', { symbol, interval: '1h', limit: 2 });
-    const open  = parseFloat(data[0][1]);
-    const close = parseFloat(data[data.length - 1][4]);
-    return ((close - open) / open) * 100;
+    const d = await apiGet('/api/v3/klines', {symbol, interval:'1h', limit:2});
+    const open = parseFloat(d[0][1]);
+    const close = parseFloat(d[d.length-1][4]);
+    return ((close-open)/open)*100;
   } catch(e) { return 0; }
 }
 
-async function execBuy(symbol, usdtAmount, type) {
-  const price = await getPrice(symbol);
-  if (!price) return null;
-  if (!usdtAmount || isNaN(usdtAmount) || usdtAmount <= 0) {
-    log(`[${type}] Valor invalido: ${usdtAmount} — aguardando saldo`);
+function calcRSI(prices, period=14) {
+  if (prices.length < period+1) return 50;
+  let g=0, l=0;
+  for (let i=prices.length-period; i<prices.length; i++) {
+    const d = prices[i]-prices[i-1];
+    if (d>0) g+=d; else l+=Math.abs(d);
+  }
+  const rs = (g/period)/((l/period)||0.001);
+  return 100-(100/(1+rs));
+}
+
+// ── BUY / SELL ──
+async function execBuy(symbol, usdtAmt, type) {
+  if (!usdtAmt || isNaN(usdtAmt) || usdtAmt < 1) {
+    log(`[${type}] Valor invalido: ${usdtAmt}`);
     return null;
   }
-  let qty = usdtAmount / price;
+  const price = await getPrice(symbol);
+  if (!price || price <= 0) return null;
 
-  // Round based on price magnitude
-  if (price > 1000) qty = parseFloat(qty.toFixed(5));
-  else if (price > 1) qty = parseFloat(qty.toFixed(2));
-  else qty = parseFloat(qty.toFixed(0));
-  if (!qty || isNaN(qty) || qty <= 0) return null;
+  let qty = usdtAmt / price;
+  if (price > 10000) qty = parseFloat(qty.toFixed(6));
+  else if (price > 100) qty = parseFloat(qty.toFixed(4));
+  else if (price > 1)   qty = parseFloat(qty.toFixed(2));
+  else                  qty = parseFloat(qty.toFixed(0));
 
-  log(`[${type.toUpperCase()}][${PAPER_MODE?'SIM':'REAL'}] BUY ${qty} ${symbol} @ $${price.toFixed(6)} (~$${usdtAmount})`);
+  if (!qty || qty <= 0 || isNaN(qty)) return null;
+
+  log(`[${type}][${PAPER_MODE?'SIM':'REAL'}] BUY ${qty} ${symbol} @ $${price.toFixed(4)} (~$${usdtAmt.toFixed(2)})`);
 
   if (!PAPER_MODE) {
     try {
-      await apiPost('/api/v3/order', { symbol, side: 'BUY', type: 'MARKET', quantity: qty });
+      await apiPost('/api/v3/order', {symbol, side:'BUY', type:'MARKET', quantity:qty});
     } catch(e) {
-      log(`Erro compra ${symbol}: ${e.response?.data?.msg || e.message}`);
+      log(`Erro compra ${symbol}: ${e.response?.data?.msg||e.message}`);
       return null;
     }
   }
+
   tradeCount++;
-  return { entryPrice: price, qty, usdt: usdtAmount, ts: Date.now() };
+  await notify(`capital. — [${type}] Compra!`, `${qty} ${symbol.replace('USDT','')} @ $${price.toFixed(4)} (~$${usdtAmt.toFixed(2)})`);
+  return { entryPrice:price, qty, usdt:usdtAmt, ts:Date.now() };
 }
 
 async function execSell(symbol, pos, reason, type) {
   const price = await getPrice(symbol);
   if (!price) return;
-  const pnlPct  = ((price - pos.entryPrice) / pos.entryPrice) * 100;
-  const pnlUsdt = pos.usdt * (pnlPct / 100);
-  totalPnL += pnlUsdt;
-  log(`[${type.toUpperCase()}][${PAPER_MODE?'SIM':'REAL'}] SELL ${symbol} @ $${price.toFixed(6)} | ${pnlPct.toFixed(3)}% | $${pnlUsdt.toFixed(2)} | ${reason}`);
+  const pct  = ((price-pos.entryPrice)/pos.entryPrice)*100;
+  const pnl  = pos.usdt*(pct/100);
+  totalPnL  += pnl;
+  log(`[${type}][${PAPER_MODE?'SIM':'REAL'}] SELL ${symbol} @ $${price.toFixed(4)} | ${pct.toFixed(2)}% | $${pnl.toFixed(2)} | ${reason}`);
 
   if (!PAPER_MODE) {
     try {
-      await apiPost('/api/v3/order', { symbol, side: 'SELL', type: 'MARKET', quantity: pos.qty });
-    } catch(e) { log(`Erro venda ${symbol}: ${e.response?.data?.msg || e.message}`); return; }
+      await apiPost('/api/v3/order', {symbol, side:'SELL', type:'MARKET', quantity:pos.qty});
+    } catch(e) { log(`Erro venda ${symbol}: ${e.response?.data?.msg||e.message}`); return; }
   }
+
   tradeCount++;
-  const emoji = pnlUsdt >= 0 ? '📈' : '📉';
-  await notify(
-    `capital. ${emoji} [${type}] ${pnlUsdt>=0?'Lucro':'Stop'}`,
-    `${symbol.replace('USDT','')} ${pnlPct>=0?'+':''}${pnlPct.toFixed(2)}% ($${pnlUsdt>=0?'+':''}${pnlUsdt.toFixed(2)}) | PnL: $${totalPnL.toFixed(2)}\n${reason}`
-  );
-  if (totalPnL <= -getPauseLoss())   { paused=true; await notify('capital. — Pausado', `Perda de $${Math.abs(totalPnL).toFixed(2)} atingiu limite (${(PAUSE_LOSS_PCT*100).toFixed(0)}%).`); }
-  if (totalPnL >= getPauseProfit())  { paused=true; await notify('capital. — Meta!', `Lucro de $${totalPnL.toFixed(2)} (${(PAUSE_PROFIT_PCT*100).toFixed(0)}% do capital)!`); }
+  await notify(`capital. ${pnl>=0?'📈 Lucro':'📉 Stop'} [${type}]`,
+    `${symbol.replace('USDT','')} ${pct>=0?'+':''}${pct.toFixed(2)}% ($${pnl.toFixed(2)}) | PnL total: $${totalPnL.toFixed(2)}`);
+
+  if (totalPnL <= -(totalBalance*PAUSE_LOSS_PCT))   { paused=true; await notify('capital. — Pausado!', `Perda de $${Math.abs(totalPnL).toFixed(2)}`); }
+  if (totalPnL >= totalBalance*PAUSE_PROFIT_PCT)    { paused=true; await notify('capital. — Meta!', `Lucro de $${totalPnL.toFixed(2)}`); }
 }
 
-// ══════════════════════════════════════
-// STRATEGY 1 — LONG TERM HOLD
-// ══════════════════════════════════════
-async function initHolds() {
-  if (Object.keys(holdPositions).length >= HOLD_ASSETS.length) return;
-  if (!liveBalance || liveBalance <= 0) { log('Aguardando saldo para iniciar holds...'); return; }
-  const holdAmt = getHoldTradeAmt();
-  if (!holdAmt || holdAmt < 5) { log(`Hold amount muito baixo: $${holdAmt} — aguardando mais saldo`); return; }
-  log('=== Verificando posicoes HOLD ===');
+// ── STRATEGY 1: HOLD ──
+async function runHold() {
+  if (totalBalance <= 0) return;
+  const holdAmt = (totalBalance * HOLD_PCT) / HOLD_ASSETS.length;
+  if (holdAmt < 5) { log(`Hold amount baixo: $${holdAmt.toFixed(2)}`); return; }
+
+  // Buy missing holds
   for (const asset of HOLD_ASSETS) {
     if (!holdPositions[asset.symbol]) {
-      const pos = await execBuy(asset.symbol, asset.allocation, 'HOLD');
-      if (pos) {
-        holdPositions[asset.symbol] = { ...pos, reason: asset.reason };
-        await notify(
-          'capital. — Hold iniciado!',
-          `${asset.name} comprado para longo prazo ($${asset.allocation})\n${asset.reason}`
-        );
-        await new Promise(r => setTimeout(r, 500));
-      }
+      log(`[HOLD] Iniciando posicao em ${asset.symbol} ($${holdAmt.toFixed(2)})`);
+      const pos = await execBuy(asset.symbol, holdAmt, 'HOLD');
+      if (pos) holdPositions[asset.symbol] = pos;
+      await new Promise(r=>setTimeout(r,500));
     }
   }
-  if(Object.keys(holdPositions).length > 0) log('Holds ativos: ' + Object.keys(holdPositions).join(', '));
-}
 
-async function manageHolds() {
+  // Manage existing holds
   for (const symbol of Object.keys(holdPositions)) {
     const pos   = holdPositions[symbol];
     const price = await getPrice(symbol);
     if (!price) continue;
-    const pnlPct = ((price - pos.entryPrice) / pos.entryPrice) * 100;
-    log(`[HOLD] ${symbol} | Entry:$${pos.entryPrice.toFixed(4)} | Now:$${price.toFixed(4)} | PnL:${pnlPct.toFixed(2)}%`);
-
-    if (pnlPct >= 40) {
-      // Take profit at +40%
-      await execSell(symbol, pos, 'Take Profit longo prazo +40%', 'HOLD');
+    const pct = ((price-pos.entryPrice)/pos.entryPrice)*100;
+    log(`[HOLD] ${symbol} PnL:${pct.toFixed(2)}%`);
+    if (pct >= HOLD_TP_PCT*100) {
+      await execSell(symbol, pos, `TP +${pct.toFixed(2)}%`, 'HOLD');
       delete holdPositions[symbol];
-      // Rebuy immediately to maintain position
-      await new Promise(r => setTimeout(r, 1000));
-      const newPos = await execBuy(symbol, getHoldTradeAmt(), 'HOLD');
-      if (newPos) holdPositions[symbol] = { ...newPos, reason: pos.reason };
-    } else if (pnlPct <= -25) {
-      // Stop loss at -25% — serious market crash
-      await execSell(symbol, pos, 'Stop Loss emergência -25%', 'HOLD');
+      // Rebuy immediately
+      const newPos = await execBuy(symbol, (totalBalance*HOLD_PCT)/HOLD_ASSETS.length, 'HOLD');
+      if (newPos) holdPositions[symbol] = newPos;
+    } else if (pct <= -(HOLD_STOP_PCT*100)) {
+      await execSell(symbol, pos, `SL ${pct.toFixed(2)}%`, 'HOLD');
       delete holdPositions[symbol];
-      await notify('capital. — ALERTA HOLD', `${symbol.replace('USDT','')} caiu -25%! Posição fechada.`);
     }
   }
 }
 
-// ══════════════════════════════════════
-// STRATEGY 2 — SCALPING AGRESSIVO
-// ══════════════════════════════════════
-async function runScalping() {
-  const scalpInUse = Object.values(scalpPositions).reduce((s,p)=>s+p.usdt, 0);
+// ── STRATEGY 2: SCALP ──
+async function runScalp() {
+  if (totalBalance <= 0) return;
+  const scalpCap   = totalBalance * SCALP_PCT;
+  const perTrade   = Math.max(5, scalpCap * SCALP_TRADE_PCT);
+  const scalpInUse = Object.values(scalpPositions).reduce((s,p)=>s+p.usdt,0);
 
-  // Manage open scalp positions
+  // Manage open positions
   for (const symbol of Object.keys(scalpPositions)) {
     const pos   = scalpPositions[symbol];
     const price = await getPrice(symbol);
     if (!price) continue;
-    const pnlPct = ((price - pos.entryPrice) / pos.entryPrice) * 100;
-
-    if (pnlPct >= 1.5) {
-      await execSell(symbol, pos, `Scalp TP +${pnlPct.toFixed(2)}%`, 'SCALP');
-      delete scalpPositions[symbol];
-    } else if (pnlPct <= -1.5) {
-      await execSell(symbol, pos, `Scalp SL ${pnlPct.toFixed(2)}%`, 'SCALP');
-      delete scalpPositions[symbol];
-    } else {
-      // RSI exit
-      const closes = await getKlines(symbol, '1m', 20);
-      const rsi = calcRSI(closes);
-      if (rsi > 70 && pnlPct > 0.3) {
-        await execSell(symbol, pos, `RSI ${rsi.toFixed(1)} + lucro`, 'SCALP');
-        delete scalpPositions[symbol];
-      }
+    const pct = ((price-pos.entryPrice)/pos.entryPrice)*100;
+    if      (pct >=  SCALP_TP_PCT*100) { await execSell(symbol,pos,`TP +${pct.toFixed(2)}%`,'SCALP'); delete scalpPositions[symbol]; }
+    else if (pct <= -SCALP_SL_PCT*100) { await execSell(symbol,pos,`SL ${pct.toFixed(2)}%`,'SCALP'); delete scalpPositions[symbol]; }
+    else {
+      const closes = await getKlines(symbol,'1m',20);
+      if (calcRSI(closes) > 70 && pct > 0.3) { await execSell(symbol,pos,'RSI alto','SCALP'); delete scalpPositions[symbol]; }
     }
   }
 
-  // Scan for new scalp opportunities
   if (Object.keys(scalpPositions).length >= 5) return;
-  if (scalpInUse >= getScalpCapital()) return;
+  if (scalpInUse >= scalpCap) return;
 
-  const perTrade = getScalpTradeAmt();
+  // Scan for buys
   const checks = SCALP_ASSETS
-    .filter(a => !scalpPositions[a.symbol])
-    .map(async (asset) => {
+    .filter(s => !scalpPositions[s])
+    .map(async symbol => {
       try {
-        const [closes1m, closes5m, change1h] = await Promise.all([
-          getKlines(asset.symbol, '1m', 20),
-          getKlines(asset.symbol, '5m', 20),
-          get1hChange(asset.symbol)
+        const [c1m, c5m, ch] = await Promise.all([
+          getKlines(symbol,'1m',20),
+          getKlines(symbol,'5m',20),
+          get1hChange(symbol)
         ]);
-        const rsi1m = calcRSI(closes1m);
-        const rsi5m = calcRSI(closes5m);
-        const drop  = closes1m.length > 3 ? ((closes1m[closes1m.length-1] - closes1m[closes1m.length-4]) / closes1m[closes1m.length-4]) * 100 : 0;
-        return { asset, rsi1m, rsi5m, drop, change1h };
+        const rsi1 = calcRSI(c1m);
+        const rsi5 = calcRSI(c5m);
+        const drop = c1m.length>3 ? ((c1m[c1m.length-1]-c1m[c1m.length-4])/c1m[c1m.length-4])*100 : 0;
+        return {symbol, rsi1, rsi5, drop, ch};
       } catch(e) { return null; }
     });
 
   const results = await Promise.all(checks);
   for (const r of results) {
-    if (!r || scalpPositions[r.asset.symbol]) continue;
-    const { asset, rsi1m, rsi5m, drop, change1h } = r;
-
-    // Buy signal: RSI oversold on both timeframes + any drop
-    const buySig = rsi1m < 40 && rsi5m < 50 && drop <= -0.1;
-    // Momentum: price surging on 1h
-    const momentumSig = change1h > 2 && rsi1m < 65;
-
-    if (buySig || momentumSig) {
-      const reason = buySig ? `RSI ${rsi1m.toFixed(1)}/drop ${drop.toFixed(2)}%` : `Momentum +${change1h.toFixed(2)}%`;
-      log(`[SCALP] SINAL ${asset.symbol} — ${reason}`);
-      const pos = await execBuy(asset.symbol, perTrade, 'SCALP');
-      if (pos) {
-        scalpPositions[asset.symbol] = pos;
-        await notify('capital. — Scalp!', `${asset.name} comprado\n${reason}`);
-      }
+    if (!r || scalpPositions[r.symbol]) continue;
+    log(`[SCALP] ${r.symbol} RSI:${r.rsi1.toFixed(1)} drop:${r.drop.toFixed(2)}% 1h:${r.ch.toFixed(2)}%`);
+    const buySig = r.rsi1 < 40 && r.rsi5 < 50 && r.drop <= -0.1;
+    const momSig = r.ch > 2 && r.rsi1 < 65;
+    if (buySig || momSig) {
+      const pos = await execBuy(r.symbol, perTrade, 'SCALP');
+      if (pos) scalpPositions[r.symbol] = pos;
     }
-    log(`[SCALP] ${asset.symbol} RSI:${rsi1m.toFixed(1)} drop:${drop.toFixed(2)}% 1h:${change1h.toFixed(2)}%`);
   }
 }
 
-// ══════════════════════════════════════
-// STRATEGY 3 — SENTIMENT
-// ══════════════════════════════════════
-const POSITIVE_WORDS = ['bullish','surge','gains','rally','adoption','partnership','etf','upgrade','launch','record','pump','moon','breakthrough','soar','rise'];
-const NEGATIVE_WORDS = ['bearish','crash','ban','hack','lawsuit','fraud','dump','selloff','collapse','plunge','bubble','fear','warning','risk','decline'];
+// ── STRATEGY 3: SENTIMENT ──
+const POS_WORDS = ['bullish','surge','gains','rally','adoption','etf','launch','record','soar','rise','partnership'];
+const NEG_WORDS = ['bearish','crash','ban','hack','lawsuit','fraud','dump','collapse','plunge','warning','decline'];
 
 async function fetchSentiment(coin) {
   try {
     const q = encodeURIComponent(`${coin} crypto`);
-    const r = await axios.get(`https://newsapi.org/v2/everything?q=${q}&language=en&sortBy=publishedAt&pageSize=10&apiKey=${NEWS_KEY}`, { timeout: 8000 });
-    const articles = r.data.articles || [];
+    const r = await axios.get(`https://newsapi.org/v2/everything?q=${q}&language=en&sortBy=publishedAt&pageSize=10&apiKey=${NEWS_KEY}`, {timeout:8000});
     let score = 0;
-    articles.forEach(a => {
-      const text = ((a.title || '') + ' ' + (a.description || '')).toLowerCase();
-      POSITIVE_WORDS.forEach(w => { if (text.includes(w)) score += 0.1; });
-      NEGATIVE_WORDS.forEach(w => { if (text.includes(w)) score -= 0.1; });
+    (r.data.articles||[]).forEach(a => {
+      const txt = ((a.title||'')+(a.description||'')).toLowerCase();
+      POS_WORDS.forEach(w => { if(txt.includes(w)) score+=0.1; });
+      NEG_WORDS.forEach(w => { if(txt.includes(w)) score-=0.1; });
     });
     score = Math.max(-1, Math.min(1, score));
-    sentimentCache[coin] = { score, ts: Date.now(), articles: articles.length };
-    log(`[SENTIMENT] ${coin} score: ${score.toFixed(2)} (${articles.length} articles)`);
+    sentCache[coin] = {score, ts:Date.now()};
+    log(`[SENT] ${coin} score:${score.toFixed(2)}`);
     return score;
   } catch(e) { return 0; }
 }
 
 async function runSentiment() {
-  const sentInUse = Object.values(sentimentPositions).reduce((s,p)=>s+p.usdt, 0);
-  const sentAssets = ['Bitcoin','Ethereum','Solana','XRP','Dogecoin'];
-  const sentSymbols = { 'Bitcoin':'BTCUSDT','Ethereum':'ETHUSDT','Solana':'SOLUSDT','XRP':'XRPUSDT','Dogecoin':'DOGEUSDT' };
+  if (totalBalance <= 0) return;
+  const sentCap  = totalBalance * SENT_PCT;
+  const perTrade = Math.max(5, sentCap * SENT_TRADE_PCT);
+  const sentInUse = Object.values(sentPositions).reduce((s,p)=>s+p.usdt,0);
 
-  // Manage open sentiment positions
-  for (const symbol of Object.keys(sentimentPositions)) {
-    const pos   = sentimentPositions[symbol];
+  // Manage open
+  for (const symbol of Object.keys(sentPositions)) {
+    const pos   = sentPositions[symbol];
     const price = await getPrice(symbol);
     if (!price) continue;
-    const pnlPct = ((price - pos.entryPrice) / pos.entryPrice) * 100;
-    if (pnlPct >= 5) {
-      await execSell(symbol, pos, `Sentiment TP +${pnlPct.toFixed(2)}%`, 'SENT');
-      delete sentimentPositions[symbol];
-    } else if (pnlPct <= -3) {
-      await execSell(symbol, pos, `Sentiment SL ${pnlPct.toFixed(2)}%`, 'SENT');
-      delete sentimentPositions[symbol];
-    }
+    const pct = ((price-pos.entryPrice)/pos.entryPrice)*100;
+    if      (pct >=  SENT_TP_PCT*100) { await execSell(symbol,pos,`TP +${pct.toFixed(2)}%`,'SENT'); delete sentPositions[symbol]; }
+    else if (pct <= -SENT_SL_PCT*100) { await execSell(symbol,pos,`SL ${pct.toFixed(2)}%`,'SENT'); delete sentPositions[symbol]; }
   }
 
-  if (Object.keys(sentimentPositions).length >= 2) return;
-  if (sentInUse >= getSentCapital()) return;
+  if (Object.keys(sentPositions).length >= 2) return;
+  if (sentInUse >= sentCap) return;
 
-  // Fetch sentiment for one asset at a time (rate limit)
-  const coin = sentAssets[Math.floor(Date.now() / 60000) % sentAssets.length];
-  const symbol = sentSymbols[coin];
-  if (!symbol || sentimentPositions[symbol]) return;
+  // Pick one coin to analyze per cycle
+  const coins = Object.keys(SENT_COINS);
+  const coin  = coins[Math.floor(Date.now()/60000) % coins.length];
+  const symbol = SENT_COINS[coin];
+  if (sentPositions[symbol]) return;
 
-  // Use cache if fresh (< 10 min)
-  let score;
-  if (sentimentCache[coin] && Date.now() - sentimentCache[coin].ts < 600000) {
-    score = sentimentCache[coin].score;
-  } else {
-    score = await fetchSentiment(coin);
-  }
+  const cached = sentCache[coin];
+  const score = (cached && Date.now()-cached.ts < 600000) ? cached.score : await fetchSentiment(coin);
 
   if (score > 0.3) {
-    log(`[SENTIMENT] Comprando ${symbol} — score positivo ${score.toFixed(2)}`);
-    const pos = await execBuy(symbol, getSentTradeAmt(), 'SENT');
-    if (pos) {
-      sentimentPositions[symbol] = { ...pos, sentimentScore: score };
-      await notify('capital. — Sentimento!', `${coin} score: +${score.toFixed(2)}\nNotícias positivas detectadas`);
-    }
-  } else if (score < -0.3) {
-    log(`[SENTIMENT] Sentimento negativo ${symbol}: ${score.toFixed(2)} — evitando`);
+    const pos = await execBuy(symbol, perTrade, 'SENT');
+    if (pos) sentPositions[symbol] = {...pos, score};
   }
 }
 
-// ══════════════════════════════════════
-// MAIN LOOP
-// ══════════════════════════════════════
+// ── MAIN LOOP ──
 async function runBot() {
   if (paused) { log('Bot pausado'); return; }
   lastCycle = new Date().toISOString();
 
-  // Fetch live balance FIRST and wait for it
-  await fetchBalance();
-  
-  // Only proceed if balance is valid
-  if (!liveBalance || liveBalance <= 0) {
-    log('Saldo invalido, aguardando...');
-    return;
-  }
+  await fetchTotalBalance();
+  if (!totalBalance || totalBalance <= 0) { log('Saldo zero, aguardando...'); return; }
 
-  const totalInUse = [
+  const inUse = [
     ...Object.values(holdPositions),
     ...Object.values(scalpPositions),
-    ...Object.values(sentimentPositions)
-  ].reduce((s,p)=>s+p.usdt, 0);
+    ...Object.values(sentPositions)
+  ].reduce((s,p)=>s+p.usdt,0);
 
-  log(`=== Ciclo | PnL:$${totalPnL.toFixed(2)} | Trades:${tradeCount} | InUse:$${totalInUse.toFixed(0)} | Hold:${Object.keys(holdPositions).length} Scalp:${Object.keys(scalpPositions).length} Sent:${Object.keys(sentimentPositions).length} ===`);
+  log(`=== PnL:$${totalPnL.toFixed(2)} | Trades:${tradeCount} | InUse:$${inUse.toFixed(0)} | Hold:${Object.keys(holdPositions).length} Scalp:${Object.keys(scalpPositions).length} Sent:${Object.keys(sentPositions).length} ===`);
 
-  // Always ensure holds are initialized
-  await initHolds();
-  await manageHolds();
-
-  // Run scalping and sentiment in parallel
-  await Promise.all([runScalping(), runSentiment()]);
+  await runHold();
+  await Promise.all([runScalp(), runSentiment()]);
 }
 
-// Run every 15 seconds
 setInterval(runBot, 15000);
 
-// ══════════════════════════════════════
-// HTTP SERVER
-// ══════════════════════════════════════
+// ── HTTP SERVER ──
 const server = http.createServer(async (req, res) => {
   res.setHeader('Content-Type', 'application/json');
 
-  if (req.method === 'POST' && req.url === '/force-hold') {
-    holdPositions = {};
-    await initHolds();
-    res.writeHead(200);
-    res.end(JSON.stringify({ success: true, holds: holdPositions }));
-    return;
-  }
-
-  if (req.method === 'POST' && req.url === '/pause') {
+  if (req.method==='POST' && req.url==='/pause') {
     paused = !paused;
-    log(`Bot ${paused?'PAUSADO':'RETOMADO'} via API`);
-    res.writeHead(200); res.end(JSON.stringify({ paused })); return;
+    res.writeHead(200); res.end(JSON.stringify({paused})); return;
   }
 
-  if (req.method === 'POST' && req.url === '/force-buy') {
-    try {
-      const pos = await execBuy('DOGEUSDT', getScalpTradeAmt(), 'TEST');
-      if (pos) {
-        scalpPositions['DOGEUSDT_TEST'] = pos;
-        res.writeHead(200); res.end(JSON.stringify({ success: true, ...pos, mode: PAPER_MODE?'sim':'real' }));
-      } else {
-        res.writeHead(500); res.end(JSON.stringify({ error: 'buy failed' }));
-      }
-    } catch(e) { res.writeHead(500); res.end(JSON.stringify({ error: e.message })); }
-    return;
+  if (req.method==='POST' && req.url==='/force-hold') {
+    holdPositions = {};
+    await fetchTotalBalance();
+    await runHold();
+    res.writeHead(200); res.end(JSON.stringify({success:true, holds:holdPositions, balance:totalBalance})); return;
   }
 
-  const status = {
-    status: 'online',
-    mode: PAPER_MODE ? 'simulado' : 'real',
-    pnl: `$${totalPnL.toFixed(2)}`,
-    tradeCount,
-    paused,
-    lastCycle,
-    capital: {
-      liveBalance: `$${liveBalance.toFixed(2)}`,
-      holdAlloc: `$${getHoldCapital().toFixed(2)} (50%)`,
-      scalpAlloc: `$${getScalpCapital().toFixed(2)} (35%)`,
-      sentAlloc: `$${getSentCapital().toFixed(2)} (15%)`,
-      holdInUse: Object.values(holdPositions).reduce((s,p)=>s+p.usdt,0).toFixed(2),
-      scalpInUse: Object.values(scalpPositions).reduce((s,p)=>s+p.usdt,0).toFixed(2),
-      sentInUse: Object.values(sentimentPositions).reduce((s,p)=>s+p.usdt,0).toFixed(2),
+  if (req.method==='POST' && req.url==='/force-buy') {
+    await fetchTotalBalance();
+    const amt = Math.max(5, (totalBalance*SCALP_PCT*SCALP_TRADE_PCT));
+    const pos = await execBuy('DOGEUSDT', amt, 'TEST');
+    res.writeHead(200); res.end(JSON.stringify({success:!!pos, pos, mode:PAPER_MODE?'sim':'real'})); return;
+  }
+
+  const holdInUse  = Object.values(holdPositions).reduce((s,p)=>s+p.usdt,0);
+  const scalpInUse = Object.values(scalpPositions).reduce((s,p)=>s+p.usdt,0);
+  const sentInUse  = Object.values(sentPositions).reduce((s,p)=>s+p.usdt,0);
+
+  res.writeHead(200); res.end(JSON.stringify({
+    status:'online', mode:PAPER_MODE?'simulado':'real',
+    pnl:`$${totalPnL.toFixed(2)}`, tradeCount, paused, lastCycle,
+    capital:{
+      total:`$${totalBalance.toFixed(2)}`,
+      holdAlloc:`$${(totalBalance*HOLD_PCT).toFixed(2)} (50%)`,
+      scalpAlloc:`$${(totalBalance*SCALP_PCT).toFixed(2)} (35%)`,
+      sentAlloc:`$${(totalBalance*SENT_PCT).toFixed(2)} (15%)`,
+      holdInUse:`$${holdInUse.toFixed(2)}`,
+      scalpInUse:`$${scalpInUse.toFixed(2)}`,
+      sentInUse:`$${sentInUse.toFixed(2)}`,
     },
-    positions: {
-      hold: holdPositions,
-      scalp: scalpPositions,
-      sentiment: sentimentPositions
-    },
-    sentimentCache
-  };
-  res.writeHead(200); res.end(JSON.stringify(status));
+    positions:{ hold:holdPositions, scalp:scalpPositions, sentiment:sentPositions },
+    sentCache
+  }));
 });
 
 server.listen(PORT, () => {
-  log(`capital. Bot v2 — HOLD + SCALP + SENTIMENT`);
-  log(`${PAPER_MODE?'MODO SIMULADO':'MODO REAL'} | Ciclo: 15s`);
-  log(`Alocacao: Hold 50% | Scalp 35% | Sentiment 15% — baseado no saldo real da conta`);
+  log(`capital. Bot v3 | ${PAPER_MODE?'SIMULADO':'REAL'} | Ciclo:15s`);
+  log(`Hold:50% | Scalp:35% | Sentimento:15%`);
   runBot();
 });
