@@ -56,14 +56,14 @@ async function fetchBalance() {
   return liveBalance;
 }
 
-function getHoldCapital()   { return liveBalance * HOLD_PCT; }
-function getScalpCapital()  { return liveBalance * SCALP_PCT; }
-function getSentCapital()   { return liveBalance * SENTIMENT_PCT; }
-function getScalpTradeAmt() { return Math.max(5, getScalpCapital() * SCALP_TRADE_PCT); }
-function getSentTradeAmt()  { return Math.max(5, getSentCapital() * SENT_TRADE_PCT); }
-function getHoldTradeAmt()  { const v = getHoldCapital() / 3; return (!v || isNaN(v)) ? 0 : v; }
-function getPauseLoss()     { return liveBalance * PAUSE_LOSS_PCT; }
-function getPauseProfit()   { return liveBalance * PAUSE_PROFIT_PCT; }
+function getHoldCapital()   { return (liveBalance || 0) * HOLD_PCT; }
+function getScalpCapital()  { return (liveBalance || 0) * SCALP_PCT; }
+function getSentCapital()   { return (liveBalance || 0) * SENTIMENT_PCT; }
+function getScalpTradeAmt() { const v = getScalpCapital() * SCALP_TRADE_PCT; return Math.max(5, isNaN(v) ? 5 : v); }
+function getSentTradeAmt()  { const v = getSentCapital() * SENT_TRADE_PCT; return Math.max(5, isNaN(v) ? 5 : v); }
+function getHoldTradeAmt()  { const v = getHoldCapital() / 3; return (!v || isNaN(v) || v < 5) ? 0 : v; }
+function getPauseLoss()     { return (liveBalance || 0) * PAUSE_LOSS_PCT; }
+function getPauseProfit()   { return (liveBalance || 0) * PAUSE_PROFIT_PCT; }
 
 // ══════════════════════════════════════
 // ASSETS
@@ -416,8 +416,14 @@ async function runBot() {
   if (paused) { log('Bot pausado'); return; }
   lastCycle = new Date().toISOString();
 
-  // Fetch live balance every cycle
+  // Fetch live balance FIRST and wait for it
   await fetchBalance();
+  
+  // Only proceed if balance is valid
+  if (!liveBalance || liveBalance <= 0) {
+    log('Saldo invalido, aguardando...');
+    return;
+  }
 
   const totalInUse = [
     ...Object.values(holdPositions),
