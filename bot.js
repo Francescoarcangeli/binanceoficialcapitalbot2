@@ -334,10 +334,7 @@ async function runScalp() {
     }
   }
 
-  if (Object.keys(scalpPos).length >= SCALP_MAX_POS) return;
-  if (freeUSDT < perTrade) return;
-
-  // Pick random sample of symbols to scan (avoid scanning all 400+ pairs)
+  // Pick random sample of symbols to scan
   const candidates = scalpSymbols
     .filter(s => !scalpPos[s] && !HOLD_COINS.includes(s))
     .sort(() => Math.random()-0.5)
@@ -359,11 +356,34 @@ async function runScalp() {
 
   for (const r of results) {
     if (!r || scalpPos[r.symbol]) continue;
-    if (Object.keys(scalpPos).length >= SCALP_MAX_POS) break;
-    const oversold  = r.rsi1 < SCALP_RSI_BUY && r.rsi5 < 45 && r.drop <= -0.1;
-    const momentum  = r.ch > 3 && r.rsi1 < 65 && r.rsi1 > 40;
-    if (oversold || momentum) {
-      log(`[SCALP] SINAL ${r.symbol} RSI:${r.rsi1.toFixed(1)} drop:${r.drop.toFixed(2)}% 1h:${r.ch.toFixed(2)}%`);
+    if (Object.keys(scalpPos).length >= SCALP_MAX_POS && freeUSDT >= perTrade) break;
+
+    const oversold = r.rsi1 < SCALP_RSI_BUY && r.rsi5 < 45 && r.drop <= -0.1;
+    const momentum = r.ch > 3 && r.rsi1 < 65 && r.rsi1 > 40;
+    const strongSignal = r.rsi1 < 25 && r.drop <= -0.5; // very strong signal
+
+    if (!oversold && !momentum && !strongSignal) continue;
+
+    log(`[SCALP] SINAL ${r.symbol} RSI:${r.rsi1.toFixed(1)} drop:${r.drop.toFixed(2)}% 1h:${r.ch.toFixed(2)}%`);
+
+    // If full but strong signal — rotate worst position
+    if (Object.keys(scalpPos).length >= SCALP_MAX_POS && strongSignal && freeUSDT < perTrade) {
+      // Find worst performing position
+      let worstSymbol = null, worstPct = 0;
+      for (const [sym, pos] of Object.entries(scalpPos)) {
+        const price = await getPrice(sym);
+        if (!price) continue;
+        const pct = ((price-pos.entryPrice)/pos.entryPrice)*100;
+        if (pct < worstPct) { worstPct = pct; worstSymbol = sym; }
+      }
+      if (worstSymbol && worstPct < -0.3) {
+        log(`[SCALP] ROTACAO: vendendo ${worstSymbol} (${worstPct.toFixed(2)}%) para comprar ${r.symbol}`);
+        await execSell(worstSymbol, scalpPos[worstSymbol], `Rotacao para ${r.symbol}`, 'SCALP');
+        delete scalpPos[worstSymbol];
+      }
+    }
+
+    if (freeUSDT >= perTrade) {
       const pos = await execBuy(r.symbol, perTrade, 'SCALP');
       if (pos) scalpPos[r.symbol] = pos;
     }
@@ -409,15 +429,62 @@ async function runSentiment() {
     else if (pct <= -SENT_SL*100) { await execSell(symbol,pos,`SL ${pct.toFixed(2)}%`,'SENT'); delete sentPos[symbol]; }
   }
 
-  if (Object.keys(sentPos).length >= SENT_MAX_POS) return;
-  if (freeUSDT < perTrade) return;
-
   const coins = {'Bitcoin':'BTCUSDT','Ethereum':'ETHUSDT','Solana':'SOLUSDT','XRP':'XRPUSDT','Dogecoin':'DOGEUSDT'};
   const coin  = Object.keys(coins)[Math.floor(Date.now()/60000) % Object.keys(coins).length];
   const symbol = coins[coin];
-  if (sentPos[symbol]) return;
 
   const score = await getSentiment(coin);
+
+  // BREAKING NEWS — very negative: sell holds immediately
+  if (score < -0.7) {
+    log(`[SENT] NOTICIA URGENTE NEGATIVA ${coin}: ${score.toFixed(2)} — vendendo posicao`);
+    if (holdPos[symbol]) {
+      await execSell(symbol, holdPos[symbol], `Noticia urgente negativa (${score.toFixed(2)})`, 'HOLD');
+      delete holdPos[symbol];
+      await notify('capital. 🚨 Notícia urgente!', `${coin} — score ${score.toFixed(2)}
+Vendendo posição de hold!`);
+    }
+    if (sentPos[symbol]) {
+      await execSell(symbol, sentPos[symbol], `Noticia urgente negativa (${score.toFixed(2)})`, 'SENT');
+      delete sentPos[symbol];
+    }
+    return;
+  }
+
+  // BREAKING NEWS — very positive: buy more even if full
+  if (score > 0.7) {
+    log(`[SENT] NOTICIA URGENTE POSITIVA ${coin}: ${score.toFixed(2)}`);
+    await notify('capital. 📰 Notícia positiva!', `${coin} — score ${score.toFixed(2)}
+Abrindo posição!`);
+    if (!sentPos[symbol] && freeUSDT >= perTrade) {
+      const pos = await execBuy(symbol, perTrade*1.5, 'SENT');
+      if (pos) sentPos[symbol] = {...pos, score};
+      return;
+    }
+    // Rotate worst scalp for this opportunity
+    if (sentPos[symbol] === undefined && freeUSDT < perTrade) {
+      let worstSym = null, worstPct = 0;
+      for (const [sym, pos] of Object.entries(scalpPos)) {
+        const price = await getPrice(sym);
+        if (!price) continue;
+        const pct = ((price-pos.entryPrice)/pos.entryPrice)*100;
+        if (pct < worstPct) { worstPct = pct; worstSym = sym; }
+      }
+      if (worstSym) {
+        log(`[SENT] ROTACAO noticia: vendendo ${worstSym} para comprar ${symbol}`);
+        await execSell(worstSym, scalpPos[worstSym], `Rotacao noticia urgente ${coin}`, 'SCALP');
+        delete scalpPos[worstSym];
+        const pos = await execBuy(symbol, perTrade, 'SENT');
+        if (pos) sentPos[symbol] = {...pos, score};
+      }
+    }
+    return;
+  }
+
+  if (Object.keys(sentPos).length >= SENT_MAX_POS) return;
+  if (freeUSDT < perTrade) return;
+  if (sentPos[symbol]) return;
+
   if (score > 0.3) {
     const pos = await execBuy(symbol, perTrade, 'SENT');
     if (pos) sentPos[symbol] = {...pos, score};
