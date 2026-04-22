@@ -203,10 +203,9 @@ async function detectPumps() {
 
     if (freeUSDT < 1) break;
 
-    // Use more capital for stronger pumps
-    const strength = Math.min(pump.change1h / 10, 3); // 0-3x multiplier
-    const base     = Math.max(1, freeUSDT * 0.30);
-    const amt      = Math.min(base * strength, freeUSDT * 0.80);
+    // Use full available capital for strongest pump
+    const strength = Math.min(pump.change1h / 10, 3);
+    const amt      = Math.max(1, freeUSDT * Math.min(0.95, 0.30 * strength));
 
     log(`[PUMP] 🚀 ${pump.symbol} +${pump.change1h.toFixed(1)}% em 1h | Comprando $${amt.toFixed(2)}`);
     const pos = await execBuy(pump.symbol, amt, 'PUMP');
@@ -241,6 +240,55 @@ async function loadSymbols() {
       .map(s => s.symbol);
     log(`Carregados ${scalpSymbols.length} pares USDT para scalp`);
   } catch(e) { log(`Erro ao carregar símbolos: ${e.message}`); }
+}
+
+// ════════════════════════════════════════
+// ONE-TIME REBALANCE
+// ════════════════════════════════════════
+async function rebalanceNow() {
+  log('=== REBALANCE: vendendo tudo exceto holds ===');
+  
+  // Sell all scalp positions
+  for (const symbol of [...Object.keys(scalpPos)]) {
+    const pos = scalpPos[symbol];
+    await execSell(symbol, pos, 'Rebalance', 'SCALP');
+    delete scalpPos[symbol];
+    await new Promise(r=>setTimeout(r,300));
+  }
+  
+  // Sell all sentiment positions
+  for (const symbol of [...Object.keys(sentPos)]) {
+    const pos = sentPos[symbol];
+    await execSell(symbol, pos, 'Rebalance', 'SENT');
+    delete sentPos[symbol];
+    await new Promise(r=>setTimeout(r,300));
+  }
+
+  await fetchBalance();
+  log(`Capital livre após vender: $${freeUSDT.toFixed(2)}`);
+
+  // Symbols to buy
+  const targets = [
+    { symbol: 'CHIPUSDT',  pct: 0.60, name: 'CHIP'          },
+    { symbol: 'SPARKUSDT', pct: 0.15, name: 'SPARK'         },
+    { symbol: 'NEIROUSDT', pct: 0.15, name: 'First NEIRO'   },
+    { symbol: 'PPUSDT',    pct: 0.10, name: 'Pudgy Penguins' },
+  ];
+
+  for (const t of targets) {
+    const amt = freeUSDT * t.pct;
+    if (amt < 1) { log(`Skip ${t.symbol}: $${amt.toFixed(2)} muito baixo`); continue; }
+    log(`[REBALANCE] Comprando ${t.name} ($${amt.toFixed(2)} = ${(t.pct*100).toFixed(0)}%)`);
+    const pos = await execBuy(t.symbol, amt, 'PUMP');
+    if (pos) {
+      scalpPos[t.symbol] = {...pos, isPump:true, pumpPct:50};
+      await notify(`capital. 🎯 Rebalance`, `Comprou ${t.name} $${amt.toFixed(2)}`);
+    }
+    await new Promise(r=>setTimeout(r,500));
+  }
+
+  log('=== REBALANCE COMPLETO ===');
+  await notify('capital. ✅ Rebalance completo!', `CHIP 60% | SPARK 15% | NEIRO 15% | PUDGY 10%`);
 }
 
 // ════════════════════════════════════════
@@ -403,7 +451,7 @@ async function runHold() {
 // ════════════════════════════════════════
 async function runScalp() {
   const scalpCap   = freeUSDT * SCALP_PCT;
-  const perTrade   = Math.max(1, scalpCap * SCALP_TRADE_PCT);
+  const perTrade   = Math.max(1, scalpCap); // unlimited — use full scalp allocation
   const scalpInUse = Object.values(scalpPos).reduce((s,p)=>s+p.usdt, 0);
 
   // Manage open positions
@@ -622,6 +670,11 @@ const server = http.createServer(async (req, res) => {
     await sellAll();
     initialized = false;
     res.writeHead(200); res.end(JSON.stringify({success:true, freeUSDT})); return;
+  }
+
+  if (req.method==='POST' && req.url==='/rebalance') {
+    await rebalanceNow();
+    res.writeHead(200); res.end(JSON.stringify({success:true, freeUSDT, positions:scalpPos})); return;
   }
 
   if (req.method==='POST' && req.url==='/pause') {
