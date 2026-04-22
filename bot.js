@@ -36,7 +36,7 @@ const SENT_SL        = 0.03;  // -3%
 const SENT_MAX_POS   = 2;
 const SENT_TRADE_PCT = 0.20;  // each sentiment = 20% of sentiment capital
 
-const CYCLE_MS       = 10000; // run every 10 seconds
+const CYCLE_MS       = 5000;  // run every 5 seconds
 const PAUSE_LOSS_PCT = 0.20;  // pause if lose 20%
 const PAUSE_WIN_PCT  = 0.50;  // pause if gain 50%
 
@@ -129,69 +129,94 @@ async function get1hChange(symbol) {
 }
 
 async function detectPumps() {
-  // Scan all symbols for massive price movements
+  // Scan random 60 pairs each cycle for pumps
   const sample = scalpSymbols
-    .filter(s => !scalpPos[s] && !HOLD_COINS.includes(s))
+    .filter(s => !HOLD_COINS.includes(s))
     .sort(() => Math.random()-0.5)
-    .slice(0, 50); // scan 50 random pairs each cycle
+    .slice(0, 60);
 
-  const pumps = [];
-  await Promise.all(sample.map(async symbol => {
+  const tickers = await Promise.all(sample.map(async symbol => {
     try {
-      const [ticker, klines5m] = await Promise.all([
+      const [ticker, k5m, k1h] = await Promise.all([
         apiGet('/api/v3/ticker/24hr', {symbol}),
-        getKlines(symbol, '5m', 3)
+        getKlines(symbol, '5m', 4),
+        getKlines(symbol, '1h', 2)
       ]);
-      const change1h = parseFloat(ticker.priceChangePercent);
-      const change5m = klines5m.length >= 2 
-        ? ((klines5m[klines5m.length-1] - klines5m[0]) / klines5m[0]) * 100 
-        : 0;
-      const volume = parseFloat(ticker.quoteVolume);
-      
-      // Detect pump: big move + real volume
-      if ((change1h > 10 || change5m > 5) && volume > 100000) {
-        pumps.push({symbol, change1h, change5m, volume});
-        log(`[PUMP] 🚀 ${symbol} | 1h:+${change1h.toFixed(1)}% | 5m:+${change5m.toFixed(1)}% | vol:$${(volume/1000).toFixed(0)}k`);
-      }
-      // Detect dump: protect holds
-      if (change1h < -15 && HOLD_COINS.includes(symbol) && holdPos[symbol]) {
-        log(`[DUMP] ⚠️ ${symbol} caiu ${change1h.toFixed(1)}% — vendendo hold`);
-        await execSell(symbol, holdPos[symbol], `Dump detectado ${change1h.toFixed(1)}%`, 'HOLD');
-        delete holdPos[symbol];
-        await notify('capital. ⚠️ Dump detectado!', `${symbol.replace('USDT','')} caiu ${change1h.toFixed(1)}%
-Hold vendido!`);
-      }
-    } catch(e) {}
+      const change24h = parseFloat(ticker.priceChangePercent);
+      const change5m  = k5m.length >= 2 ? ((k5m[k5m.length-1]-k5m[0])/k5m[0])*100 : 0;
+      const change1h  = k1h.length >= 2 ? ((k1h[k1h.length-1]-k1h[0])/k1h[0])*100 : 0;
+      const volume    = parseFloat(ticker.quoteVolume);
+      return {symbol, change24h, change5m, change1h, volume};
+    } catch(e) { return null; }
   }));
 
-  // Buy top pumping coins
-  pumps.sort((a,b) => b.change1h - a.change1h);
-  for (const pump of pumps.slice(0, 2)) {
-    if (scalpPos[pump.symbol]) continue;
-    if (Object.keys(scalpPos).length >= SCALP_MAX_POS && freeUSDT < 1) {
-      // Rotate worst position
-      let worstSym = null, worstPct = 0;
-      for (const [sym, pos] of Object.entries(scalpPos)) {
-        const price = await getPrice(sym);
-        if (!price) continue;
-        const pct = ((price-pos.entryPrice)/pos.entryPrice)*100;
-        if (pct < worstPct) { worstPct = pct; worstSym = sym; }
-      }
-      if (worstSym && worstPct < -0.5) {
-        log(`[PUMP] Rotacionando ${worstSym} → ${pump.symbol}`);
-        await execSell(worstSym, scalpPos[worstSym], `Rotacao pump ${pump.symbol}`, 'SCALP');
-        delete scalpPos[worstSym];
-      }
+  const pumps = tickers
+    .filter(t => t && t.volume > 50000 && (t.change1h > 5 || t.change5m > 2))
+    .sort((a,b) => b.change1h - a.change1h);
+
+  if (pumps.length === 0) return;
+
+  log(`[PUMP] Detectados ${pumps.length} pumps: ${pumps.slice(0,3).map(p=>`${p.symbol}(${p.change1h.toFixed(1)}%)`).join(', ')}`);
+
+  // Step 1: Sell ALL scalp/sent positions that are NOT pumping
+  const pumpSymbols = new Set(pumps.map(p => p.symbol));
+  
+  for (const symbol of [...Object.keys(scalpPos)]) {
+    if (pumpSymbols.has(symbol)) continue; // keep if pumping
+    const pos   = scalpPos[symbol];
+    const price = await getPrice(symbol);
+    if (!price) continue;
+    const pct = ((price-pos.entryPrice)/pos.entryPrice)*100;
+    // Sell if stagnant (< +0.5%) or negative
+    if (pct < 0.5) {
+      log(`[PUMP] Vendendo ${symbol} (${pct.toFixed(2)}%) para liberar capital`);
+      await execSell(symbol, pos, `Liberando capital para pump`, 'SCALP');
+      delete scalpPos[symbol];
     }
-    if (freeUSDT >= 1) {
-      const amt = Math.max(1, freeUSDT * SCALP_PCT * 0.15);
-      log(`[PUMP] Comprando ${pump.symbol} +${pump.change1h.toFixed(1)}%`);
-      const pos = await execBuy(pump.symbol, amt, 'PUMP');
-      if (pos) {
-        scalpPos[pump.symbol] = {...pos, isPump:true, pumpPct:pump.change1h};
-        await notify(`capital. 🚀 PUMP detectado!`, `${pump.symbol.replace('USDT','')} +${pump.change1h.toFixed(1)}% em 1h
-Comprando $${amt.toFixed(2)}`);
+  }
+
+  for (const symbol of [...Object.keys(sentPos)]) {
+    if (pumpSymbols.has(symbol)) continue;
+    const pos   = sentPos[symbol];
+    const price = await getPrice(symbol);
+    if (!price) continue;
+    const pct = ((price-pos.entryPrice)/pos.entryPrice)*100;
+    if (pct < 0.5) {
+      log(`[PUMP] Vendendo sent ${symbol} (${pct.toFixed(2)}%) para liberar capital`);
+      await execSell(symbol, pos, `Liberando capital para pump`, 'SENT');
+      delete sentPos[symbol];
+    }
+  }
+
+  // Step 2: Concentrate capital on top pumping coins
+  for (const pump of pumps.slice(0, 3)) {
+    if (scalpPos[pump.symbol]) {
+      // Already holding — check if should add more
+      const pos = scalpPos[pump.symbol];
+      const price = await getPrice(pump.symbol);
+      if (price) {
+        const pct = ((price-pos.entryPrice)/pos.entryPrice)*100;
+        log(`[PUMP] Já tenho ${pump.symbol} +${pct.toFixed(2)}%`);
       }
+      continue;
+    }
+
+    if (freeUSDT < 1) break;
+
+    // Use more capital for stronger pumps
+    const strength = Math.min(pump.change1h / 10, 3); // 0-3x multiplier
+    const base     = Math.max(1, freeUSDT * 0.30);
+    const amt      = Math.min(base * strength, freeUSDT * 0.80);
+
+    log(`[PUMP] 🚀 ${pump.symbol} +${pump.change1h.toFixed(1)}% em 1h | Comprando $${amt.toFixed(2)}`);
+    const pos = await execBuy(pump.symbol, amt, 'PUMP');
+    if (pos) {
+      scalpPos[pump.symbol] = {...pos, isPump:true, pumpPct:pump.change1h};
+      await notify(
+        `capital. 🚀 PUMP! ${pump.symbol.replace('USDT','')}`,
+        `+${pump.change1h.toFixed(1)}% em 1h | +${pump.change5m.toFixed(1)}% em 5min
+Comprando $${amt.toFixed(2)}`
+      );
     }
   }
 }
