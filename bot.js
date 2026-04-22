@@ -56,6 +56,10 @@ let startBalance = 0;
 let holdPos      = {};   // { BTCUSDT: {entryPrice, qty, usdt, ts} }
 let trendPos     = {};   // active trend trades
 let dipPos       = {};   // active dip trades
+let oppPos       = {};   // opportunist — any coin pumping
+let sentPos      = {};   // sentiment — news based
+let sentCache    = {};   // cache news scores
+let allSymbols   = [];   // all Binance USDT pairs
 let totalPnL     = 0;
 let tradeCount   = 0;
 let paused       = false;
@@ -505,6 +509,121 @@ Vendendo posição`);
   }
 }
 
+// ── FREE CAPITAL ─────────────────────────────────────
+async function freeCapitalIfNeeded() {
+  if (freeUSDT >= 2) return; // enough to trade
+  
+  log('[CAPITAL] USDT insuficiente — procurando pior posição para vender...');
+
+  // Check all non-hold positions for worst performer
+  let worstSymbol = null;
+  let worstPct    = 0;
+  let worstPos    = null;
+  let worstType   = null;
+
+  for (const [sym, pos] of Object.entries(trendPos)) {
+    const price = await getPrice(sym);
+    if (!price) continue;
+    const pct = ((price-pos.entryPrice)/pos.entryPrice)*100;
+    if (pct < worstPct) { worstPct=pct; worstSymbol=sym; worstPos=pos; worstType='trend'; }
+  }
+  for (const [sym, pos] of Object.entries(dipPos)) {
+    const price = await getPrice(sym);
+    if (!price) continue;
+    const pct = ((price-pos.entryPrice)/pos.entryPrice)*100;
+    if (pct < worstPct) { worstPct=pct; worstSymbol=sym; worstPos=pos; worstType='dip'; }
+  }
+  for (const [sym, pos] of Object.entries(oppPos)) {
+    const price = await getPrice(sym);
+    if (!price) continue;
+    const pct = ((price-pos.entryPrice)/pos.entryPrice)*100;
+    if (pct < worstPct) { worstPct=pct; worstSymbol=sym; worstPos=pos; worstType='opp'; }
+  }
+  for (const [sym, pos] of Object.entries(sentPos)) {
+    const price = await getPrice(sym);
+    if (!price) continue;
+    const pct = ((price-pos.entryPrice)/pos.entryPrice)*100;
+    if (pct < worstPct) { worstPct=pct; worstSymbol=sym; worstPos=pos; worstType='sent'; }
+  }
+
+  // Collect ALL non-hold positions with their performance
+  const allPositions = [];
+  for (const [sym,pos] of Object.entries(trendPos)) {
+    const price = await getPrice(sym);
+    if (!price) continue;
+    const pct = ((price-pos.entryPrice)/pos.entryPrice)*100;
+    allPositions.push({sym, pos, pct, type:'trend'});
+  }
+  for (const [sym,pos] of Object.entries(dipPos)) {
+    const price = await getPrice(sym);
+    if (!price) continue;
+    const pct = ((price-pos.entryPrice)/pos.entryPrice)*100;
+    allPositions.push({sym, pos, pct, type:'dip'});
+  }
+  for (const [sym,pos] of Object.entries(oppPos)) {
+    const price = await getPrice(sym);
+    if (!price) continue;
+    const pct = ((price-pos.entryPrice)/pos.entryPrice)*100;
+    allPositions.push({sym, pos, pct, type:'opp'});
+  }
+  for (const [sym,pos] of Object.entries(sentPos)) {
+    const price = await getPrice(sym);
+    if (!price) continue;
+    const pct = ((price-pos.entryPrice)/pos.entryPrice)*100;
+    allPositions.push({sym, pos, pct, type:'sent'});
+  }
+
+  // Sort by worst performance and sell bottom 3
+  allPositions.sort((a,b)=>a.pct-b.pct);
+  const toSell = allPositions.slice(0, 3);
+
+  if (toSell.length > 0) {
+    for (const item of toSell) {
+      log(`[CAPITAL] Vendendo ${item.sym} (${item.pct.toFixed(2)}%)`);
+      await sell(item.sym, item.pos, `Liberando capital (${item.pct.toFixed(2)}%)`);
+      if (item.type==='trend') delete trendPos[item.sym];
+      if (item.type==='dip')   delete dipPos[item.sym];
+      if (item.type==='opp')   delete oppPos[item.sym];
+      if (item.type==='sent')  delete sentPos[item.sym];
+      await new Promise(r=>setTimeout(r,300));
+    }
+    await fetchBalance();
+    return;
+  }
+
+  // If no tracked positions, check actual Binance balance for untracked coins
+  try {
+    const data = await signedGet('/api/v3/account');
+    let worstAsset=null, worstVal=Infinity, worstQty=0;
+    const NEVER_SELL = new Set(['BTC','ETH','SOL','USDT','BRL','EUR','GBP','BUSD','USDC']);
+    
+    for (const b of data.balances) {
+      const qty = parseFloat(b.free);
+      if (qty<=0) continue;
+      if (NEVER_SELL.has(b.asset)) continue;
+      const symbol = b.asset+'USDT';
+      const price  = await getPrice(symbol);
+      if (!price || qty*price<0.5) continue;
+      // Check 24h performance
+      const ticker = await getTicker(symbol);
+      if (!ticker) continue;
+      const ch24h = parseFloat(ticker.priceChangePercent);
+      if (ch24h < worstVal) { worstVal=ch24h; worstAsset=b.asset; worstQty=qty; }
+    }
+
+    if (worstAsset) {
+      log(`[CAPITAL] Vendendo ${worstAsset} não rastreado (24h: ${worstVal.toFixed(1)}%)`);
+      const symbol = worstAsset+'USDT';
+      const qty    = await getAdjQty(symbol, worstQty);
+      if (qty>0 && !PAPER_MODE) {
+        await signedPost('/api/v3/order',{symbol,side:'SELL',type:'MARKET',quantity:qty});
+        log(`[CAPITAL] Vendido ${qty} ${worstAsset}`);
+      }
+      await fetchBalance();
+    }
+  } catch(e) { log(`Erro freeCapital: ${e.message}`); }
+}
+
 // ── MAIN LOOP ─────────────────────────────────────────
 async function runBot() {
   if (paused) { log('Bot pausado — use /resume para retomar'); return; }
@@ -512,6 +631,9 @@ async function runBot() {
 
   await fetchBalance();
   if (totalBalance<=0) { log('Sem saldo'); return; }
+  
+  // Free up capital if needed
+  if (freeUSDT < 2) await freeCapitalIfNeeded();
 
   const holdInUse  = Object.values(holdPos).reduce((s,p)=>s+p.usdt,0);
   const trendInUse = Object.values(trendPos).reduce((s,p)=>s+p.usdt,0);
