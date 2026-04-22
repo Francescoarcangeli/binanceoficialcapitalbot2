@@ -270,9 +270,9 @@ async function rebalanceNow() {
   // Symbols to buy
   const targets = [
     { symbol: 'CHIPUSDT',  pct: 0.60, name: 'CHIP'          },
-    { symbol: 'SPARKUSDT', pct: 0.15, name: 'SPARK'         },
+    { symbol: 'SPKUSDT', pct: 0.15, name: 'SPARK'         },
     { symbol: 'NEIROUSDT', pct: 0.15, name: 'First NEIRO'   },
-    { symbol: 'PPUSDT',    pct: 0.10, name: 'Pudgy Penguins' },
+    { symbol: 'PENGUUSDT',    pct: 0.10, name: 'Pudgy Penguins' },
   ];
 
   for (const t of targets) {
