@@ -128,6 +128,74 @@ async function get1hChange(symbol) {
   } catch(e) { return 0; }
 }
 
+async function detectPumps() {
+  // Scan all symbols for massive price movements
+  const sample = scalpSymbols
+    .filter(s => !scalpPos[s] && !HOLD_COINS.includes(s))
+    .sort(() => Math.random()-0.5)
+    .slice(0, 50); // scan 50 random pairs each cycle
+
+  const pumps = [];
+  await Promise.all(sample.map(async symbol => {
+    try {
+      const [ticker, klines5m] = await Promise.all([
+        apiGet('/api/v3/ticker/24hr', {symbol}),
+        getKlines(symbol, '5m', 3)
+      ]);
+      const change1h = parseFloat(ticker.priceChangePercent);
+      const change5m = klines5m.length >= 2 
+        ? ((klines5m[klines5m.length-1] - klines5m[0]) / klines5m[0]) * 100 
+        : 0;
+      const volume = parseFloat(ticker.quoteVolume);
+      
+      // Detect pump: big move + real volume
+      if ((change1h > 10 || change5m > 5) && volume > 100000) {
+        pumps.push({symbol, change1h, change5m, volume});
+        log(`[PUMP] 🚀 ${symbol} | 1h:+${change1h.toFixed(1)}% | 5m:+${change5m.toFixed(1)}% | vol:$${(volume/1000).toFixed(0)}k`);
+      }
+      // Detect dump: protect holds
+      if (change1h < -15 && HOLD_COINS.includes(symbol) && holdPos[symbol]) {
+        log(`[DUMP] ⚠️ ${symbol} caiu ${change1h.toFixed(1)}% — vendendo hold`);
+        await execSell(symbol, holdPos[symbol], `Dump detectado ${change1h.toFixed(1)}%`, 'HOLD');
+        delete holdPos[symbol];
+        await notify('capital. ⚠️ Dump detectado!', `${symbol.replace('USDT','')} caiu ${change1h.toFixed(1)}%
+Hold vendido!`);
+      }
+    } catch(e) {}
+  }));
+
+  // Buy top pumping coins
+  pumps.sort((a,b) => b.change1h - a.change1h);
+  for (const pump of pumps.slice(0, 2)) {
+    if (scalpPos[pump.symbol]) continue;
+    if (Object.keys(scalpPos).length >= SCALP_MAX_POS && freeUSDT < 1) {
+      // Rotate worst position
+      let worstSym = null, worstPct = 0;
+      for (const [sym, pos] of Object.entries(scalpPos)) {
+        const price = await getPrice(sym);
+        if (!price) continue;
+        const pct = ((price-pos.entryPrice)/pos.entryPrice)*100;
+        if (pct < worstPct) { worstPct = pct; worstSym = sym; }
+      }
+      if (worstSym && worstPct < -0.5) {
+        log(`[PUMP] Rotacionando ${worstSym} → ${pump.symbol}`);
+        await execSell(worstSym, scalpPos[worstSym], `Rotacao pump ${pump.symbol}`, 'SCALP');
+        delete scalpPos[worstSym];
+      }
+    }
+    if (freeUSDT >= 1) {
+      const amt = Math.max(1, freeUSDT * SCALP_PCT * 0.15);
+      log(`[PUMP] Comprando ${pump.symbol} +${pump.change1h.toFixed(1)}%`);
+      const pos = await execBuy(pump.symbol, amt, 'PUMP');
+      if (pos) {
+        scalpPos[pump.symbol] = {...pos, isPump:true, pumpPct:pump.change1h};
+        await notify(`capital. 🚀 PUMP detectado!`, `${pump.symbol.replace('USDT','')} +${pump.change1h.toFixed(1)}% em 1h
+Comprando $${amt.toFixed(2)}`);
+      }
+    }
+  }
+}
+
 function calcRSI(prices, period=14) {
   if (prices.length < period+1) return 50;
   let g=0, l=0;
@@ -319,16 +387,23 @@ async function runScalp() {
     const price = await getPrice(symbol);
     if (!price) continue;
     const pct = ((price-pos.entryPrice)/pos.entryPrice)*100;
-    if (pct >= SCALP_TP*100) {
-      await execSell(symbol, pos, `TP +${pct.toFixed(2)}%`, 'SCALP');
+    const isPump = pos.isPump;
+    const tp = isPump ? 0.08 : SCALP_TP; // pump TP at +8%
+    const sl = isPump ? 0.03 : SCALP_SL; // pump SL at -3%
+    if (pct >= tp*100) {
+      await execSell(symbol, pos, `TP +${pct.toFixed(2)}%${isPump?' [PUMP]':''}`, 'SCALP');
       delete scalpPos[symbol];
-    } else if (pct <= -(SCALP_SL*100)) {
-      await execSell(symbol, pos, `SL ${pct.toFixed(2)}%`, 'SCALP');
+    } else if (pct <= -(sl*100)) {
+      await execSell(symbol, pos, `SL ${pct.toFixed(2)}%${isPump?' [PUMP]':''}`, 'SCALP');
       delete scalpPos[symbol];
     } else {
       const closes = await getKlines(symbol, '1m', 20);
-      if (calcRSI(closes) > SCALP_RSI_SELL && pct > 0.3) {
-        await execSell(symbol, pos, `RSI alto`, 'SCALP');
+      const rsi = calcRSI(closes);
+      if (isPump && rsi > 85 && pct > 2) {
+        await execSell(symbol, pos, `RSI pump ${rsi.toFixed(0)} +${pct.toFixed(2)}%`, 'SCALP');
+        delete scalpPos[symbol];
+      } else if (!isPump && rsi > SCALP_RSI_SELL && pct > 0.3) {
+        await execSell(symbol, pos, `RSI alto ${rsi.toFixed(0)}`, 'SCALP');
         delete scalpPos[symbol];
       }
     }
@@ -509,7 +584,7 @@ async function runBot() {
   log(`=== PnL:$${totalPnL.toFixed(2)} (${roi}%) | Trades:${tradeCount} | USDT:$${freeUSDT.toFixed(2)} | Hold:${Object.keys(holdPos).length} Scalp:${Object.keys(scalpPos).length} Sent:${Object.keys(sentPos).length} ===`);
 
   await runHold();
-  await Promise.all([runScalp(), runSentiment()]);
+  await Promise.all([runScalp(), runSentiment(), detectPumps()]);
 }
 
 // ════════════════════════════════════════
