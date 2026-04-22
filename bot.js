@@ -151,6 +151,20 @@ async function fetchBalance() {
   } catch(e) { log(`Erro saldo: ${e.message}`); }
 }
 
+// ── LOAD ALL SYMBOLS ─────────────────────────────────
+async function loadSymbols() {
+  try {
+    const d = await apiGet('/api/v3/exchangeInfo');
+    allSymbols = d.symbols
+      .filter(s=>s.quoteAsset==='USDT' && s.status==='TRADING')
+      .map(s=>s.symbol);
+    log(`${allSymbols.length} pares USDT carregados`);
+  } catch(e) { 
+    log(`Erro loadSymbols: ${e.message}`);
+    allSymbols = [];
+  }
+}
+
 // ── GET LOT SIZE ─────────────────────────────────────
 async function getAdjQty(symbol, rawQty) {
   try {
