@@ -422,7 +422,7 @@ const server = http.createServer(async(req,res)=>{
 
 // ── START ─────────────────────────────────────────────
 server.listen(PORT, async()=>{
-  log(`capital. Bot v11 | ${PAPER_MODE?'SIMULADO':'REAL'} | ${CYCLE_MS/1000}s ciclo`);
+  log(`capital. Bot v11 | ${PAPER_MODE?'SIMULADO':'REAL'} | 2s proteção | 10s ranking`);
   log(`Hold 50%: BTC+ETH+SOL | Active 50%: top ${TOP_N} momentum`);
   log(`Trailing stop: +${TRAIL_START}% trigger, -${TRAIL_DROP}% do topo`);
   await fetchBalance();
