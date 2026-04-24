@@ -329,7 +329,7 @@ async function rotateIfNeeded(minUSDT=2) {
   
   for (const item of ranked.slice(0,3)) {
     if (freeUSDT>=minUSDT) break;
-    if (!item.pos || item.pos.usdt<1) continue; // skip tiny positions
+    if (!item.pos || item.pos.usdt<MIN_TRADE) continue; // skip tiny positions
     log(`[ROTATE] Vendendo ${item.sym} (${item.pct.toFixed(2)}%) para liberar capital`);
     const sold = await sell(item.sym,item.pos,`Rotação capital (${item.pct.toFixed(2)}%)`);
     if (sold) delete activePos[item.sym];
@@ -388,14 +388,15 @@ async function scanAndBuy() {
       const k1m=await getKlines(symbol,'1m',3);
       const ch1m=k1m.length>=2?((k1m[k1m.length-1]-k1m[k1m.length-2])/k1m[k1m.length-2])*100:0;
 
-      // Pump signal — any timeframe
-      if (ch24h>=BUY_CH24H||ch1h>=BUY_CH1H||ch1m>=BUY_CH1M) {
+      // Pump signal — coin must be clearly pumping with good volume
+      const isPumping = (ch24h>=BUY_CH24H || ch1h>=BUY_CH1H || ch1m>=BUY_CH1M);
+      if (isPumping && ch24h > -5) { // must not be crashing on 24h even if 1h pumps
         if (rsi>88) return null; // already overbought
-        return {symbol,ch24h,ch1h,ch1m,vol,rsi,score:ch24h+ch1h*2+ch1m*3,type:'pump'};
+        return {symbol,ch24h,ch1h,ch1m,vol,rsi,score:ch24h*0.5+ch1h*2+ch1m*3,type:'pump'};
       }
       // Dip signal
-      if (ch1h<=BUY_DIP&&rsi<=35) {
-        return {symbol,ch24h,ch1h,ch5m,vol,rsi,score:-ch1h,type:'dip'};
+      if (ch1h<=BUY_DIP&&rsi<=35&&ch24h>-20) {
+        return {symbol,ch24h,ch1h,vol,rsi,score:-ch1h,type:'dip'};
       }
       return null;
     } catch(e) { return null; }
@@ -415,10 +416,11 @@ async function scanAndBuy() {
     let amt;
     if (opp.type==='pump') {
       const strength=Math.min(opp.ch24h/BUY_CH24H, 5); // 1-5x
-      amt=Math.min(freeUSDT*0.80, Math.max(2, freeUSDT*0.20*strength));
+      amt=Math.min(freeUSDT*0.80, Math.max(MIN_TRADE, freeUSDT*0.20*strength));
     } else {
-      amt=Math.min(freeUSDT*0.40, Math.max(2, activeCap*0.15));
+      amt=Math.min(freeUSDT*0.40, Math.max(MIN_TRADE, activeCap*0.15));
     }
+    if (amt < MIN_TRADE) { log(`[SKIP] ${opp.symbol}: valor $${amt.toFixed(2)} abaixo do mínimo`); continue; }
 
     const p=await buy(opp.symbol,amt,opp.type==='pump'?'PUMP':'DIP');
     if (p) {
