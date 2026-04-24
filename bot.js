@@ -2,7 +2,6 @@ const http   = require('http');
 const axios  = require('axios');
 const crypto = require('crypto');
 
-// ── CONFIG ──────────────────────────────────────────
 const API_KEY    = process.env.BINANCE_API_KEY    || '';
 const API_SECRET = process.env.BINANCE_API_SECRET || '';
 const PAPER_MODE = process.env.PAPER_MODE !== 'false';
@@ -11,48 +10,43 @@ const NEWS_KEY   = '8c729e78ee7e477295c572995346f88f';
 const PORT       = process.env.PORT || 3000;
 const BASE       = 'https://api.binance.com';
 
-// ── COINS ────────────────────────────────────────────
-const HOLD_COINS  = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'];
-const TRADE_COINS = ['XRPUSDT', 'CHIPUSDT', 'DOGEUSDT', 'BNBUSDT', 'BIAUSDT', 'NEIROUSDT', 'SPKUSDT', 'STRKUSDT'];
-const NEVER_SELL  = new Set(['BTC','ETH','SOL','USDT','BRL','EUR','GBP','BUSD','USDC']);
+// ── FIXED RULES ──────────────────────────────────────
+const HOLD_COINS = ['BTCUSDT','ETHUSDT','SOLUSDT'];
+const HOLD_PCT   = 0.50;  // 50% always in holds
+const HOLD_TP    = 20;    // sell hold at +20%, rebuy
+const HOLD_SL    = 12;    // emergency stop -12%
 
-// ── ALLOCATION ───────────────────────────────────────
-const HOLD_PCT   = 0.45;
-const TREND_PCT  = 0.25;
-const DIP_PCT    = 0.13;
-const OPP_PCT    = 0.12;
-const SENT_PCT   = 0.05;
+// ── ACTIVE TRADING (remaining 50%) ───────────────────
+// Buy signals — any timeframe
+const BUY_CH24H  = 8;    // buy if +8% in 24h
+const BUY_CH1H   = 8;    // or +8% in 1h  
+const BUY_CH1M   = 8;    // or +8% in 1min
+const BUY_DIP    = -5;   // buy dip if -5% in 1h + RSI < 35
+const MIN_VOL    = 50000; // min $50k volume
 
-// ── STRATEGY PARAMS ──────────────────────────────────
-const HOLD_TP        = 20;   const HOLD_SL        = 12;
-const TREND_BUY_CH1H = 3;    const TREND_TP       = 5;    const TREND_SL = 3;  const TREND_RSI_SELL = 75;
-const DIP_BUY_CH1H   = -5;   const DIP_RSI_BUY    = 35;   const DIP_TP   = 4;  const DIP_SL   = 2;
-const OPP_BUY_CH24H  = 10;   const OPP_BUY_CH1H   = 5;    const OPP_BUY_CH5M = 3;
-const OPP_TP         = 12;   const OPP_SL         = 6;    const OPP_MAX_POS  = 5;  const OPP_MIN_VOL = 500000;
-const SENT_BUY_SCORE = 0.3;  const SENT_TP        = 6;    const SENT_SL  = 3;  const SENT_MAX_POS = 2;
-const SENT_POS_WORDS = ['bullish','surge','partnership','etf','adoption','launch','upgrade','record','soar','rally','elon','moon','pump','approved','listed'];
-const SENT_NEG_WORDS = ['bearish','crash','ban','hack','lawsuit','fraud','dump','collapse','warning','decline','fear','sell','scam','arrest','bubble'];
-const CYCLE_MS       = 10000;
-const PAUSE_LOSS_PCT = 0.25;
-const PAUSE_WIN_PCT  = 0.50;
+// Sell signals — any timeframe
+const SELL_DROP24H = -10; // sell if -10% in 24h
+const SELL_DROP1H  = -10; // sell if -10% in 1h
+const SELL_DROP1M  = -10; // sell if -10% in 1min
+const SELL_TP    = 8;    // take profit +8%
+const SELL_SL    = 4;    // stop loss -4%
+const SELL_PUMP_TP = 20; // take profit +20% for big pumps
+const SELL_RSI   = 78;   // sell if RSI overbought
+
+const CYCLE_MS   = 8000; // 8 second cycle
+const SCAN_SIZE  = 120;  // pairs to scan per cycle
 
 // ── STATE ────────────────────────────────────────────
 let freeUSDT     = 0;
-let totalBalance = 0;   // excludes locked CHIP value
-let chipLocked   = 0;   // current CHIP value — excluded from redistribution
+let totalBalance = 0;
 let startBalance = 0;
 let holdPos      = {};
-let trendPos     = {};
-let dipPos       = {};
-let oppPos       = {};
-let sentPos      = {};
-let sentCache    = {};
+let activePos    = {};  // all active trading positions
 let allSymbols   = [];
 let totalPnL     = 0;
 let tradeCount   = 0;
 let paused       = false;
 let lastCycle    = null;
-let chipInitialized = false;
 
 // ── UTILS ────────────────────────────────────────────
 const log = msg => console.log(`[${new Date().toLocaleString('pt-BR',{timeZone:'America/Sao_Paulo'})}] ${msg}`);
@@ -89,14 +83,9 @@ async function getPrice(symbol) {
   catch(e) { return 0; }
 }
 
-async function getKlines(symbol, interval='1h', limit=3) {
+async function getKlines(symbol, interval='1h', limit=20) {
   try { const d=await apiGet('/api/v3/klines',{symbol,interval,limit}); return d.map(k=>parseFloat(k[4])); }
   catch(e) { return []; }
-}
-
-async function getTicker(symbol) {
-  try { return await apiGet('/api/v3/ticker/24hr',{symbol}); }
-  catch(e) { return null; }
 }
 
 function calcRSI(prices, period=14) {
@@ -109,51 +98,68 @@ function calcRSI(prices, period=14) {
   return 100-(100/(1+rs));
 }
 
-function ch1h(klines) {
-  if (klines.length<2) return 0;
-  return ((klines[klines.length-1]-klines[klines.length-2])/klines[klines.length-2])*100;
-}
-
-// ── LOAD SYMBOLS ─────────────────────────────────────
+// ── LOAD ALL SYMBOLS ─────────────────────────────────
 async function loadSymbols() {
   try {
     const d=await apiGet('/api/v3/exchangeInfo');
     allSymbols=d.symbols.filter(s=>s.quoteAsset==='USDT'&&s.status==='TRADING').map(s=>s.symbol);
-    log(`${allSymbols.length} pares carregados`);
+    log(`${allSymbols.length} pares USDT carregados`);
   } catch(e) { log(`Erro loadSymbols: ${e.message}`); }
 }
 
 // ── BALANCE ──────────────────────────────────────────
 async function fetchBalance() {
   try {
-    const data = await signedGet('/api/v3/account');
-    let usdt=0, total=0, chipVal=0;
+    const data=await signedGet('/api/v3/account');
+    let usdt=0, total=0;
     for (const b of data.balances) {
       const qty=parseFloat(b.free)+parseFloat(b.locked);
       if (qty<=0) continue;
       if (b.asset==='USDT') { usdt=parseFloat(b.free); total+=qty; continue; }
       if (['BRL','EUR','GBP','BUSD','USDC'].includes(b.asset)) continue;
-      try {
-        const p=await getPrice(b.asset+'USDT');
-        if (p>0) {
-          const val=qty*p;
-          total+=val;
-          if (b.asset==='CHIP') chipVal=val;
-        }
-      } catch(e) {}
+      try { const p=await getPrice(b.asset+'USDT'); if(p>0) total+=qty*p; } catch(e){}
     }
-
-    // First time: lock current CHIP value
-    if (!chipInitialized) {
-      chipLocked=chipVal;
-      chipInitialized=true;
-      log(`CHIP locked: $${chipLocked.toFixed(2)} — excluído da redistribuição`);
-    }
-
-    freeUSDT=usdt;
-    totalBalance=total-chipLocked; // exclude locked CHIP from redistributable capital
-    log(`Saldo: total=$${total.toFixed(2)} | CHIP(locked)=$${chipLocked.toFixed(2)} | redistribuível=$${totalBalance.toFixed(2)} | USDT=$${usdt.toFixed(2)}`);
+    freeUSDT=usdt; totalBalance=total;
+    log(`Saldo: $${total.toFixed(2)} | USDT livre: $${usdt.toFixed(2)}`);
   } catch(e) { log(`Erro saldo: ${e.message}`); }
+}
+
+// ── SYNC EXISTING POSITIONS ───────────────────────────
+// Reads actual Binance balance and registers untracked coins
+async function syncPositions() {
+  try {
+    const data=await signedGet('/api/v3/account');
+    const SKIP=new Set(['USDT','BRL','EUR','GBP','BUSD','USDC']);
+    const holdAssets=new Set(HOLD_COINS.map(s=>s.replace('USDT','')));
+
+    for (const b of data.balances) {
+      const qty=parseFloat(b.free)+parseFloat(b.locked);
+      if (qty<=0) continue;
+      if (SKIP.has(b.asset)) continue;
+      const symbol=b.asset+'USDT';
+
+      // If it's a hold coin, register in holdPos if not tracked
+      if (holdAssets.has(b.asset)) {
+        if (!holdPos[symbol]) {
+          const price=await getPrice(symbol);
+          if (price>0) {
+            holdPos[symbol]={entryPrice:price,qty,usdt:qty*price,ts:Date.now(),tag:'HOLD',synced:true};
+            log(`[SYNC] Hold registrado: ${symbol} qty:${qty} @ $${price.toFixed(4)}`);
+          }
+        }
+        continue;
+      }
+
+      // Register as active position if not tracked
+      if (!activePos[symbol]) {
+        const price=await getPrice(symbol);
+        if (price>0 && qty*price>0.5) {
+          activePos[symbol]={entryPrice:price,qty,usdt:qty*price,ts:Date.now(),tag:'SYNC',peak:price};
+          log(`[SYNC] Posição registrada: ${symbol} $${(qty*price).toFixed(2)}`);
+        }
+      }
+    }
+  } catch(e) { log(`Erro sync: ${e.message}`); }
 }
 
 // ── GET LOT SIZE ─────────────────────────────────────
@@ -186,7 +192,7 @@ async function buy(symbol, usdtAmt, tag) {
   }
   freeUSDT-=usdtAmt; tradeCount++;
   await notify(`capital. 🟢 [${tag}]`,`${symbol.replace('USDT','')} @ $${price.toFixed(4)} (~$${usdtAmt.toFixed(2)})`);
-  return {entryPrice:price,qty,usdt:usdtAmt,ts:Date.now(),tag};
+  return {entryPrice:price,qty,usdt:usdtAmt,ts:Date.now(),tag,peak:price};
 }
 
 // ── SELL ─────────────────────────────────────────────
@@ -206,89 +212,16 @@ async function sell(symbol, pos, reason) {
   await notify(`capital. ${pnl>=0?'📈':'📉'} [${pos.tag}]`,
     `${symbol.replace('USDT','')} ${pct>=0?'+':''}${pct.toFixed(2)}% ($${pnl.toFixed(2)})\nROI: ${roi}%`);
   if (startBalance>0) {
-    if (totalPnL<=-(startBalance*PAUSE_LOSS_PCT)) { paused=true; notify('capital. ⛔ Pausado',`Perda $${Math.abs(totalPnL).toFixed(2)}`); }
-    if (totalPnL>= startBalance*PAUSE_WIN_PCT)    { paused=true; notify('capital. 🏆 Meta!',`Lucro $${totalPnL.toFixed(2)}`); }
+    if (totalPnL<=-(startBalance*0.25)) { paused=true; notify('capital. ⛔ Pausado',`Perda $${Math.abs(totalPnL).toFixed(2)}`); }
+    if (totalPnL>= startBalance*0.50)   { paused=true; notify('capital. 🏆 Meta!',`Lucro $${totalPnL.toFixed(2)}`); }
   }
   return true;
 }
 
-// ── FREE CAPITAL ─────────────────────────────────────
-async function freeCapitalIfNeeded() {
-  if (freeUSDT>=2) return;
-  log('[CAPITAL] USDT insuficiente — vendendo 3 piores posições...');
-
-  const all=[];
-  for (const [s,p] of Object.entries(trendPos)) { const pr=await getPrice(s); if(pr) all.push({s,p,pct:((pr-p.entryPrice)/p.entryPrice)*100,type:'trend'}); }
-  for (const [s,p] of Object.entries(dipPos))   { const pr=await getPrice(s); if(pr) all.push({s,p,pct:((pr-p.entryPrice)/p.entryPrice)*100,type:'dip'}); }
-  for (const [s,p] of Object.entries(oppPos))   { const pr=await getPrice(s); if(pr) all.push({s,p,pct:((pr-p.entryPrice)/p.entryPrice)*100,type:'opp'}); }
-  for (const [s,p] of Object.entries(sentPos))  { const pr=await getPrice(s); if(pr) all.push({s,p,pct:((pr-p.entryPrice)/p.entryPrice)*100,type:'sent'}); }
-
-  all.sort((a,b)=>a.pct-b.pct);
-  for (const item of all.slice(0,3)) {
-    await sell(item.s,item.p,`Liberando capital (${item.pct.toFixed(2)}%)`);
-    if (item.type==='trend') delete trendPos[item.s];
-    if (item.type==='dip')   delete dipPos[item.s];
-    if (item.type==='opp')   delete oppPos[item.s];
-    if (item.type==='sent')  delete sentPos[item.s];
-    await new Promise(r=>setTimeout(r,300));
-  }
-
-  // If still no USDT, sell worst untracked coin from Binance (except NEVER_SELL)
-  if (freeUSDT<2) {
-    try {
-      const data=await signedGet('/api/v3/account');
-      let worst=null, worstCh=-Infinity, worstQty=0;
-      for (const b of data.balances) {
-        const qty=parseFloat(b.free);
-        if (qty<=0||NEVER_SELL.has(b.asset)) continue;
-        const sym=b.asset+'USDT';
-        const ticker=await getTicker(sym);
-        if (!ticker) continue;
-        const ch=parseFloat(ticker.priceChangePercent);
-        const val=qty*parseFloat(ticker.lastPrice);
-        if (val<0.5) continue;
-        if (ch<worstCh) { worstCh=ch; worst=b.asset; worstQty=qty; }
-      }
-      if (worst) {
-        const sym=worst+'USDT';
-        const qty=await getAdjQty(sym,worstQty);
-        if (qty>0&&!PAPER_MODE) {
-          await signedPost('/api/v3/order',{symbol:sym,side:'SELL',type:'MARKET',quantity:qty});
-          log(`[CAPITAL] Vendido ${worst} (24h:${worstCh.toFixed(1)}%)`);
-        }
-      }
-    } catch(e) { log(`Erro freeCapital: ${e.message}`); }
-  }
-  await fetchBalance();
-}
-
-// ── INITIAL REBALANCE ────────────────────────────────
-async function initialRebalance() {
-  log('=== REBALANCE INICIAL: vendendo tudo (exceto CHIP/BTC/ETH/SOL) ===');
-  try {
-    const data=await signedGet('/api/v3/account');
-    for (const b of data.balances) {
-      const qty=parseFloat(b.free);
-      if (qty<=0||NEVER_SELL.has(b.asset)) continue;
-      const sym=b.asset+'USDT';
-      try {
-        const adjQ=await getAdjQty(sym,qty);
-        if (adjQ<=0) continue;
-        const price=await getPrice(sym);
-        if (!price||qty*price<0.5) continue;
-        if (!PAPER_MODE) await signedPost('/api/v3/order',{symbol:sym,side:'SELL',type:'MARKET',quantity:adjQ});
-        log(`[REBALANCE] Vendido ${adjQ} ${b.asset}`);
-        await new Promise(r=>setTimeout(r,400));
-      } catch(e) { log(`Erro vendendo ${b.asset}: ${e.response?.data?.msg||e.message}`); }
-    }
-  } catch(e) { log(`Erro rebalance: ${e.message}`); }
-  await fetchBalance();
-  log(`Capital após rebalance: $${totalBalance.toFixed(2)} (USDT: $${freeUSDT.toFixed(2)})`);
-}
-
-// ── STRATEGY 1: HOLD ──────────────────────────────────
+// ── MANAGE HOLDS ─────────────────────────────────────
 async function manageHolds() {
-  const target=(totalBalance*HOLD_PCT)/HOLD_COINS.length;
+  const holdTarget=(totalBalance*HOLD_PCT)/HOLD_COINS.length;
+
   for (const symbol of [...Object.keys(holdPos)]) {
     const pos=holdPos[symbol], price=await getPrice(symbol);
     if (!price) continue;
@@ -297,15 +230,18 @@ async function manageHolds() {
     if (pct>=HOLD_TP) {
       await sell(symbol,pos,`TP +${pct.toFixed(1)}%`); delete holdPos[symbol];
       await new Promise(r=>setTimeout(r,500));
-      const p=await buy(symbol,(totalBalance*HOLD_PCT)/HOLD_COINS.length,'HOLD');
+      const newAmt=(totalBalance*HOLD_PCT)/HOLD_COINS.length;
+      const p=await buy(symbol,Math.min(newAmt,freeUSDT*0.95),'HOLD');
       if (p) holdPos[symbol]=p;
     } else if (pct<=-HOLD_SL) {
       await sell(symbol,pos,`SL ${pct.toFixed(1)}%`); delete holdPos[symbol];
     }
   }
+
+  // Buy missing holds
   for (const symbol of HOLD_COINS) {
     if (holdPos[symbol]) continue;
-    const amt=Math.min(target,freeUSDT*0.95);
+    const amt=Math.min(holdTarget, freeUSDT*0.90);
     if (amt<2) continue;
     const p=await buy(symbol,amt,'HOLD');
     if (p) holdPos[symbol]=p;
@@ -313,158 +249,171 @@ async function manageHolds() {
   }
 }
 
-// ── STRATEGY 2: TREND ────────────────────────────────
-async function manageTrend() {
-  const trendCap=totalBalance*TREND_PCT;
-  const trendInUse=Object.values(trendPos).reduce((s,p)=>s+p.usdt,0);
-  for (const symbol of [...Object.keys(trendPos)]) {
-    const pos=trendPos[symbol], price=await getPrice(symbol);
+// ── MANAGE ACTIVE POSITIONS ───────────────────────────
+async function manageActive() {
+  for (const symbol of [...Object.keys(activePos)]) {
+    const pos=activePos[symbol], price=await getPrice(symbol);
     if (!price) continue;
     const pct=((price-pos.entryPrice)/pos.entryPrice)*100;
-    if (pct>=TREND_TP) { await sell(symbol,pos,`Trend TP +${pct.toFixed(2)}%`); delete trendPos[symbol]; }
-    else if (pct<=-TREND_SL) { await sell(symbol,pos,`Trend SL ${pct.toFixed(2)}%`); delete trendPos[symbol]; }
-    else { const k=await getKlines(symbol,'1h',16); if (calcRSI(k)>TREND_RSI_SELL&&pct>1) { await sell(symbol,pos,`RSI alto`); delete trendPos[symbol]; } }
-  }
-  if (trendInUse>=trendCap*0.95||freeUSDT<2) return;
-  const signals=await Promise.all(TRADE_COINS.map(async symbol=>{
-    if (trendPos[symbol]) return null;
+
+    // Update peak
+    if (price>pos.peak) activePos[symbol].peak=price;
+    const fromPeak=((price-pos.peak)/pos.peak)*100;
+
+    // Check 24h, 1h and 1min drops — sell immediately if any drops -10%
     try {
-      const [k1h,k5m]=await Promise.all([getKlines(symbol,'1h',3),getKlines(symbol,'5m',4)]);
-      const c1h=ch1h(k1h), rsi=calcRSI(k1h);
-      const ticker=await getTicker(symbol);
-      const vol=ticker?parseFloat(ticker.quoteVolume):0;
-      return {symbol,c1h,rsi,vol};
-    } catch(e) { return null; }
-  }));
-  const valid=signals.filter(s=>s&&s.c1h>=TREND_BUY_CH1H&&s.vol>50000&&s.rsi<80).sort((a,b)=>b.c1h-a.c1h);
-  for (const sig of valid) {
-    if (freeUSDT<2) break;
-    const strength=Math.min(sig.c1h/TREND_BUY_CH1H,3);
-    const amt=Math.min(trendCap-trendInUse,Math.max(2,(trendCap/TRADE_COINS.length)*strength));
-    log(`[TREND] ${sig.symbol} +${sig.c1h.toFixed(1)}% RSI:${sig.rsi.toFixed(0)}`);
-    const p=await buy(sig.symbol,amt,'TREND');
-    if (p) trendPos[sig.symbol]=p;
+      const [ticker, k1h, k1m] = await Promise.all([
+        apiGet('/api/v3/ticker/24hr',{symbol}),
+        getKlines(symbol,'1h',3),
+        getKlines(symbol,'1m',3)
+      ]);
+      const ch24h = parseFloat(ticker.priceChangePercent);
+      const ch1h  = k1h.length>=2 ? ((k1h[k1h.length-1]-k1h[k1h.length-2])/k1h[k1h.length-2])*100 : 0;
+      const ch1m  = k1m.length>=2 ? ((k1m[k1m.length-1]-k1m[k1m.length-2])/k1m[k1m.length-2])*100 : 0;
+
+      if (ch24h<=SELL_DROP24H) {
+        await sell(symbol,pos,`Queda 24h: ${ch24h.toFixed(1)}%`); delete activePos[symbol]; continue;
+      }
+      if (ch1h<=SELL_DROP1H) {
+        await sell(symbol,pos,`Queda 1h: ${ch1h.toFixed(1)}%`); delete activePos[symbol]; continue;
+      }
+      if (ch1m<=SELL_DROP1M) {
+        await sell(symbol,pos,`Queda 1min: ${ch1m.toFixed(1)}%`); delete activePos[symbol]; continue;
+      }
+    } catch(e) {}
+
+    // Big pump — use higher TP
+    const isPump=pos.pumpPct && pos.pumpPct>=15;
+    const tp=isPump?SELL_PUMP_TP:SELL_TP;
+
+    if (pct>=tp) {
+      await sell(symbol,pos,`TP +${pct.toFixed(2)}%`); delete activePos[symbol];
+    } else if (pct<=-SELL_SL) {
+      await sell(symbol,pos,`SL ${pct.toFixed(2)}%`); delete activePos[symbol];
+    } else if (pct>5 && fromPeak<=-3) {
+      await sell(symbol,pos,`Trailing ${pct.toFixed(2)}%`); delete activePos[symbol];
+    } else {
+      const k=await getKlines(symbol,'1h',16);
+      const rsi=calcRSI(k);
+      if (rsi>SELL_RSI&&pct>1) { await sell(symbol,pos,`RSI ${rsi.toFixed(0)}`); delete activePos[symbol]; }
+    }
+  }
+}
+
+// ── ROTATE WORST ─────────────────────────────────────
+// If no free USDT, sell worst active position
+async function rotateIfNeeded(minUSDT=2) {
+  if (freeUSDT>=minUSDT) return;
+  
+  // Find worst 3 active positions
+  const ranked=[];
+  for (const [sym,pos] of Object.entries(activePos)) {
+    const price=await getPrice(sym);
+    if (!price) continue;
+    const pct=((price-pos.entryPrice)/pos.entryPrice)*100;
+    ranked.push({sym,pos,pct});
+  }
+  ranked.sort((a,b)=>a.pct-b.pct);
+  
+  for (const item of ranked.slice(0,3)) {
+    if (freeUSDT>=minUSDT) break;
+    log(`[ROTATE] Vendendo ${item.sym} (${item.pct.toFixed(2)}%) para liberar capital`);
+    await sell(item.sym,item.pos,`Rotação capital (${item.pct.toFixed(2)}%)`);
+    delete activePos[item.sym];
     await new Promise(r=>setTimeout(r,300));
   }
 }
 
-// ── STRATEGY 3: DIP ──────────────────────────────────
-async function manageDips() {
-  const dipCap=totalBalance*DIP_PCT;
-  const dipInUse=Object.values(dipPos).reduce((s,p)=>s+p.usdt,0);
-  for (const symbol of [...Object.keys(dipPos)]) {
-    const pos=dipPos[symbol], price=await getPrice(symbol);
+// ── ALWAYS SELL WORST, BUY BEST ──────────────────────
+async function sellWorstBuyBest() {
+  // Find worst active position
+  let worstSym=null, worstPct=Infinity, worstPos=null;
+  for (const [sym,pos] of Object.entries(activePos)) {
+    const price=await getPrice(sym);
     if (!price) continue;
     const pct=((price-pos.entryPrice)/pos.entryPrice)*100;
-    if (pct>=DIP_TP) { await sell(symbol,pos,`Dip TP +${pct.toFixed(2)}%`); delete dipPos[symbol]; }
-    else if (pct<=-DIP_SL) { await sell(symbol,pos,`Dip SL ${pct.toFixed(2)}%`); delete dipPos[symbol]; }
+    if (pct<worstPct) { worstPct=pct; worstSym=sym; worstPos=pos; }
   }
-  if (dipInUse>=dipCap*0.95||freeUSDT<2) return;
-  const signals=await Promise.all(TRADE_COINS.map(async symbol=>{
-    if (dipPos[symbol]) return null;
-    try { const k=await getKlines(symbol,'1h',16); return {symbol,c1h:ch1h(k),rsi:calcRSI(k)}; }
-    catch(e) { return null; }
-  }));
-  const dips=signals.filter(s=>s&&s.c1h<=DIP_BUY_CH1H&&s.rsi<=DIP_RSI_BUY).sort((a,b)=>a.c1h-b.c1h);
-  for (const dip of dips) {
-    if (freeUSDT<2) break;
-    const amt=Math.min(dipCap-dipInUse,dipCap/TRADE_COINS.length);
-    log(`[DIP] ${dip.symbol} ${dip.c1h.toFixed(1)}% RSI:${dip.rsi.toFixed(0)}`);
-    const p=await buy(dip.symbol,amt,'DIP');
-    if (p) dipPos[dip.symbol]=p;
-    await new Promise(r=>setTimeout(r,300));
+
+  // Sell worst if it's underperforming (< -1% or been held > 30min without profit)
+  if (worstSym && (worstPct<-1 || (Date.now()-worstPos.ts>1800000 && worstPct<1))) {
+    log(`[ROTATE] Vendendo pior: ${worstSym} (${worstPct.toFixed(2)}%)`);
+    await sell(worstSym,worstPos,`Rotação: pior posição ${worstPct.toFixed(2)}%`);
+    delete activePos[worstSym];
+    await fetchBalance();
   }
 }
 
-// ── STRATEGY 4: OPPORTUNIST ──────────────────────────
-async function manageOpp() {
-  const oppCap=totalBalance*OPP_PCT;
-  const oppInUse=Object.values(oppPos).reduce((s,p)=>s+p.usdt,0);
-  for (const symbol of [...Object.keys(oppPos)]) {
-    const pos=oppPos[symbol], price=await getPrice(symbol);
-    if (!price) continue;
-    const pct=((price-pos.entryPrice)/pos.entryPrice)*100;
-    if (!oppPos[symbol]) continue;
-    if (pct>=OPP_TP) { await sell(symbol,pos,`Opp TP +${pct.toFixed(2)}%`); delete oppPos[symbol]; }
-    else if (pct<=-OPP_SL) { await sell(symbol,pos,`Opp SL ${pct.toFixed(2)}%`); delete oppPos[symbol]; }
-    else if (pct>5) { if (pos.peak&&price<pos.peak*0.97) { await sell(symbol,pos,`Trailing ${pct.toFixed(2)}%`); delete oppPos[symbol]; continue; } }
-    if (oppPos[symbol]) { const p2=await getPrice(symbol); if(p2&&(!oppPos[symbol].peak||p2>oppPos[symbol].peak)) oppPos[symbol].peak=p2; }
-  }
-  if (Object.keys(oppPos).length>=OPP_MAX_POS||oppInUse>=oppCap||freeUSDT<2) return;
-  const exclude=new Set([...HOLD_COINS,...Object.keys(oppPos),...Object.keys(trendPos),...Object.keys(dipPos)]);
-  const sample=allSymbols.filter(s=>!exclude.has(s)).sort(()=>Math.random()-0.5).slice(0,100);
-  const pumps=await Promise.all(sample.map(async symbol=>{
+// ── SCAN & BUY BEST OPPORTUNITIES ────────────────────
+async function scanAndBuy() {
+  const activeCap=totalBalance*0.50;
+  
+  if (freeUSDT<2) return;
+
+  // Scan random sample of all symbols
+  const exclude=new Set([...HOLD_COINS,...Object.keys(activePos)]);
+  const sample=allSymbols
+    .filter(s=>!exclude.has(s))
+    .sort(()=>Math.random()-0.5)
+    .slice(0,SCAN_SIZE);
+
+  const results=await Promise.all(sample.map(async symbol=>{
     try {
-      const [ticker,k1h,k5m]=await Promise.all([getTicker(symbol),getKlines(symbol,'1h',3),getKlines(symbol,'5m',4)]);
-      if (!ticker) return null;
+      const [ticker,k1h]=await Promise.all([
+        apiGet('/api/v3/ticker/24hr',{symbol}),
+        getKlines(symbol,'1h',3)
+      ]);
+      const ch24h=parseFloat(ticker.priceChangePercent);
+      const ch1h=k1h.length>=2?((k1h[k1h.length-1]-k1h[k1h.length-2])/k1h[k1h.length-2])*100:0;
       const vol=parseFloat(ticker.quoteVolume);
-      if (vol<OPP_MIN_VOL) return null;
-      const c24h=parseFloat(ticker.priceChangePercent), c1h=ch1h(k1h), c5m=ch1h(k5m), rsi=calcRSI(k1h);
-      if (rsi>85) return null;
-      if (c24h>=OPP_BUY_CH24H||c1h>=OPP_BUY_CH1H||c5m>=OPP_BUY_CH5M)
-        return {symbol,c24h,c1h,c5m,vol,rsi,score:c24h+c1h*2+c5m*3};
+      const rsi=calcRSI(k1h);
+      if (vol<MIN_VOL) return null;
+
+      // 1min change
+      const k1m=await getKlines(symbol,'1m',3);
+      const ch1m=k1m.length>=2?((k1m[k1m.length-1]-k1m[k1m.length-2])/k1m[k1m.length-2])*100:0;
+
+      // Pump signal — any timeframe
+      if (ch24h>=BUY_CH24H||ch1h>=BUY_CH1H||ch1m>=BUY_CH1M) {
+        if (rsi>88) return null; // already overbought
+        return {symbol,ch24h,ch1h,ch1m,vol,rsi,score:ch24h+ch1h*2+ch1m*3,type:'pump'};
+      }
+      // Dip signal
+      if (ch1h<=BUY_DIP&&rsi<=35) {
+        return {symbol,ch24h,ch1h,ch5m,vol,rsi,score:-ch1h,type:'dip'};
+      }
       return null;
     } catch(e) { return null; }
   }));
-  const valid=pumps.filter(Boolean).sort((a,b)=>b.score-a.score);
-  for (const pump of valid.slice(0,2)) {
-    if (Object.keys(oppPos).length>=OPP_MAX_POS||freeUSDT<2) break;
-    const amt=Math.min(freeUSDT*0.40,oppCap/OPP_MAX_POS);
-    log(`[OPP] 🚀 ${pump.symbol} 24h:+${pump.c24h.toFixed(1)}% 1h:+${pump.c1h.toFixed(1)}%`);
-    const p=await buy(pump.symbol,amt,'OPP');
+
+  const opportunities=results.filter(Boolean).sort((a,b)=>b.score-a.score);
+  if (opportunities.length===0) return;
+
+  log(`Oportunidades: ${opportunities.slice(0,5).map(o=>`${o.symbol}(${o.type}:${o.ch1h.toFixed(1)}%)`).join(', ')}`);
+
+  for (const opp of opportunities) {
+    if (freeUSDT<2) break;
+    if (activePos[opp.symbol]) continue;
+
+    // Calculate how much to invest
+    // Big pump → more capital, up to 80% of free USDT
+    let amt;
+    if (opp.type==='pump') {
+      const strength=Math.min(opp.ch24h/BUY_CH24H, 5); // 1-5x
+      amt=Math.min(freeUSDT*0.80, Math.max(2, freeUSDT*0.20*strength));
+    } else {
+      amt=Math.min(freeUSDT*0.40, Math.max(2, activeCap*0.15));
+    }
+
+    const p=await buy(opp.symbol,amt,opp.type==='pump'?'PUMP':'DIP');
     if (p) {
-      oppPos[pump.symbol]={...p,peak:p.entryPrice};
-      await notify(`capital. 🚀 PUMP!`,`${pump.symbol.replace('USDT','')} +${pump.c24h.toFixed(1)}% 24h\n$${amt.toFixed(2)}`);
+      activePos[opp.symbol]={...p,pumpPct:opp.ch24h};
+      if (opp.type==='pump'&&opp.ch24h>=15) {
+        await notify(`capital. 🚀 PUMP ${opp.symbol.replace('USDT','')}!`,
+          `+${opp.ch24h.toFixed(1)}% 24h | +${opp.ch1h.toFixed(1)}% 1h\nComprando $${amt.toFixed(2)}`);
+      }
     }
     await new Promise(r=>setTimeout(r,300));
-  }
-}
-
-// ── STRATEGY 5: SENTIMENT ────────────────────────────
-const SENT_COINS={'Bitcoin':'BTCUSDT','Ethereum':'ETHUSDT','Solana':'SOLUSDT','XRP':'XRPUSDT','Dogecoin':'DOGEUSDT','BNB':'BNBUSDT','Elon':'DOGEUSDT'};
-
-async function fetchSentiment(coin) {
-  const cached=sentCache[coin];
-  if (cached&&Date.now()-cached.ts<600000) return cached.score;
-  try {
-    const r=await axios.get(`https://newsapi.org/v2/everything?q=${encodeURIComponent(coin+' crypto')}&language=en&sortBy=publishedAt&pageSize=15&apiKey=${NEWS_KEY}`,{timeout:8000});
-    let score=0;
-    (r.data.articles||[]).forEach(a=>{
-      const txt=((a.title||'')+(a.description||'')).toLowerCase();
-      SENT_POS_WORDS.forEach(w=>{if(txt.includes(w))score+=0.1;});
-      SENT_NEG_WORDS.forEach(w=>{if(txt.includes(w))score-=0.1;});
-    });
-    score=Math.max(-1,Math.min(1,parseFloat(score.toFixed(2))));
-    sentCache[coin]={score,ts:Date.now()};
-    log(`[SENT] ${coin} score:${score}`);
-    return score;
-  } catch(e) { return 0; }
-}
-
-async function manageSentiment() {
-  const sentCap=totalBalance*SENT_PCT;
-  const sentInUse=Object.values(sentPos).reduce((s,p)=>s+p.usdt,0);
-  for (const symbol of [...Object.keys(sentPos)]) {
-    const pos=sentPos[symbol], price=await getPrice(symbol);
-    if (!price) continue;
-    const pct=((price-pos.entryPrice)/pos.entryPrice)*100;
-    if (pct>=SENT_TP) { await sell(symbol,pos,`Sent TP +${pct.toFixed(2)}%`); delete sentPos[symbol]; }
-    else if (pct<=-SENT_SL) { await sell(symbol,pos,`Sent SL ${pct.toFixed(2)}%`); delete sentPos[symbol]; }
-  }
-  if (Object.keys(sentPos).length>=SENT_MAX_POS||freeUSDT<1) return;
-  const coins=Object.keys(SENT_COINS);
-  const coin=coins[Math.floor(Date.now()/120000)%coins.length];
-  const symbol=SENT_COINS[coin];
-  if (sentPos[symbol]) return;
-  const score=await fetchSentiment(coin);
-  if (score>=SENT_BUY_SCORE) {
-    const amt=Math.min(freeUSDT*0.50,sentCap/SENT_MAX_POS);
-    if (amt<1) return;
-    const p=await buy(symbol,amt,'SENT');
-    if (p) { sentPos[symbol]={...p,score,coin}; await notify(`capital. 📰 Sentiment!`,`${coin} score:+${score}\n${symbol.replace('USDT','')} $${amt.toFixed(2)}`); }
-  } else if (score<=-SENT_BUY_SCORE&&trendPos[symbol]) {
-    await sell(symbol,trendPos[symbol],`Notícia negativa score:${score}`);
-    delete trendPos[symbol];
   }
 }
 
@@ -472,37 +421,53 @@ async function manageSentiment() {
 async function runBot() {
   if (paused) { log('Bot pausado'); return; }
   lastCycle=new Date().toISOString();
+
   await fetchBalance();
   if (totalBalance<=0) { log('Sem saldo'); return; }
-  if (freeUSDT<2) await freeCapitalIfNeeded();
-  const hi=Object.values(holdPos).reduce((s,p)=>s+p.usdt,0);
-  const ti=Object.values(trendPos).reduce((s,p)=>s+p.usdt,0);
-  const di=Object.values(dipPos).reduce((s,p)=>s+p.usdt,0);
-  const oi=Object.values(oppPos).reduce((s,p)=>s+p.usdt,0);
-  const si=Object.values(sentPos).reduce((s,p)=>s+p.usdt,0);
+
+  const holdInUse=Object.values(holdPos).reduce((s,p)=>s+p.usdt,0);
+  const activeInUse=Object.values(activePos).reduce((s,p)=>s+p.usdt,0);
   const roi=startBalance>0?((totalPnL/startBalance)*100).toFixed(1):'0';
-  log(`=== PnL:$${totalPnL.toFixed(2)}(${roi}%) | USDT:$${freeUSDT.toFixed(2)} | H:$${hi.toFixed(0)} T:$${ti.toFixed(0)} D:$${di.toFixed(0)} O:$${oi.toFixed(0)} S:$${si.toFixed(0)} ===`);
+  log(`=== PnL:$${totalPnL.toFixed(2)}(${roi}%) | USDT:$${freeUSDT.toFixed(2)} | Hold:$${holdInUse.toFixed(0)} Active:$${activeInUse.toFixed(0)}(${Object.keys(activePos).length}pos) ===`);
+
+  // Sync any untracked positions from Binance
+  await syncPositions();
+
+  // Manage existing positions
   await manageHolds();
-  await manageTrend();
-  await manageDips();
-  await Promise.all([manageOpp(), manageSentiment()]);
+  await manageActive();
+
+  // Free capital if needed
+  if (freeUSDT<2) await rotateIfNeeded(2);
+
+  // Always rotate: sell worst, buy best
+  await sellWorstBuyBest();
+  
+  // Scan and buy best opportunities
+  await scanAndBuy();
 }
 
 // ── HTTP SERVER ───────────────────────────────────────
 const server=http.createServer(async(req,res)=>{
   res.setHeader('Content-Type','application/json');
-  if (req.url==='/pause')   { paused=true;  log('PAUSADO');  return res.end(JSON.stringify({paused:true})); }
-  if (req.url==='/resume')  { paused=false; log('RETOMADO'); return res.end(JSON.stringify({paused:false})); }
+
+  if (req.url==='/pause')  { paused=true;  return res.end(JSON.stringify({paused:true})); }
+  if (req.url==='/resume') { paused=false; return res.end(JSON.stringify({paused:false})); }
+
   if (req.url==='/rebalance') {
-    log('Rebalance manual iniciado...');
-    await initialRebalance();
+    log('Rebalance: zerando posições ativas e redistribuindo...');
+    // Sell all active (non-hold) positions
+    for (const [sym,pos] of Object.entries(activePos)) {
+      await sell(sym,pos,'Rebalance'); delete activePos[sym];
+      await new Promise(r=>setTimeout(r,300));
+    }
+    await fetchBalance();
+    await manageHolds();
     return res.end(JSON.stringify({success:true,freeUSDT,totalBalance}));
   }
-  const hi=Object.values(holdPos).reduce((s,p)=>s+p.usdt,0);
-  const ti=Object.values(trendPos).reduce((s,p)=>s+p.usdt,0);
-  const di=Object.values(dipPos).reduce((s,p)=>s+p.usdt,0);
-  const oi=Object.values(oppPos).reduce((s,p)=>s+p.usdt,0);
-  const si=Object.values(sentPos).reduce((s,p)=>s+p.usdt,0);
+
+  const holdInUse=Object.values(holdPos).reduce((s,p)=>s+p.usdt,0);
+  const activeInUse=Object.values(activePos).reduce((s,p)=>s+p.usdt,0);
   res.end(JSON.stringify({
     status:'online', mode:PAPER_MODE?'simulado':'real',
     paused, lastCycle, tradeCount,
@@ -510,31 +475,26 @@ const server=http.createServer(async(req,res)=>{
     roi:startBalance>0?`${((totalPnL/startBalance)*100).toFixed(1)}%`:'0%',
     capital:{
       total:`$${totalBalance.toFixed(2)}`,
-      chipLocked:`$${chipLocked.toFixed(2)}`,
       freeUSDT:`$${freeUSDT.toFixed(2)}`,
-      holdTarget:`$${(totalBalance*HOLD_PCT).toFixed(2)} (45%)`,
-      trendTarget:`$${(totalBalance*TREND_PCT).toFixed(2)} (25%)`,
-      dipTarget:`$${(totalBalance*DIP_PCT).toFixed(2)} (13%)`,
-      oppTarget:`$${(totalBalance*OPP_PCT).toFixed(2)} (12%)`,
-      sentTarget:`$${(totalBalance*SENT_PCT).toFixed(2)} (5%)`,
-      holdInUse:`$${hi.toFixed(2)}`, trendInUse:`$${ti.toFixed(2)}`,
-      dipInUse:`$${di.toFixed(2)}`, oppInUse:`$${oi.toFixed(2)}`, sentInUse:`$${si.toFixed(2)}`,
+      holdTarget:`$${(totalBalance*HOLD_PCT).toFixed(2)} (50%)`,
+      activeTarget:`$${(totalBalance*0.50).toFixed(2)} (50%)`,
+      holdInUse:`$${holdInUse.toFixed(2)}`,
+      activeInUse:`$${activeInUse.toFixed(2)}`,
     },
-    positions:{hold:holdPos,trend:trendPos,dip:dipPos,opportunist:oppPos,sentiment:sentPos},
-    coins:{holds:HOLD_COINS,trades:TRADE_COINS}
+    positions:{hold:holdPos, active:activePos},
+    activeCount:Object.keys(activePos).length
   }));
 });
 
-// ── START ─────────────────────────────────────────────
 server.listen(PORT, async()=>{
-  log(`capital. Bot v7 | ${PAPER_MODE?'SIMULADO':'REAL'} | Ciclo:10s`);
-  log(`Hold:45% | Trend:25% | Dip:13% | Opp:12% | Sent:5%`);
-  log(`CHIP: valor atual bloqueado, bot opera a partir de agora`);
+  log(`capital. Bot v8 | ${PAPER_MODE?'SIMULADO':'REAL'} | Ciclo:${CYCLE_MS/1000}s`);
+  log(`Hold 50%: BTC+ETH+SOL | Active 50%: qualquer coin`);
   await loadSymbols();
   await fetchBalance();
+  await syncPositions(); // register existing coins
   startBalance=totalBalance;
-  log(`Capital inicial (sem CHIP): $${startBalance.toFixed(2)}`);
-  await notify('capital. 🚀 Bot v7!',`Capital redistribuível: $${startBalance.toFixed(2)}\nCHIP locked: $${chipLocked.toFixed(2)}`);
+  log(`Capital inicial: $${startBalance.toFixed(2)}`);
+  await notify('capital. 🚀 Bot v8!',`Capital: $${startBalance.toFixed(2)}\nHold 50% + Active 50% livre`);
   setInterval(runBot,CYCLE_MS);
   runBot();
 });
