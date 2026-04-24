@@ -150,10 +150,10 @@ async function syncPositions() {
         continue;
       }
 
-      // Register as active position if not tracked
+      // Register as active position if not tracked and value > $1
       if (!activePos[symbol]) {
         const price=await getPrice(symbol);
-        if (price>0 && qty*price>0.5) {
+        if (price>0 && qty*price>1.0) {
           activePos[symbol]={entryPrice:price,qty,usdt:qty*price,ts:Date.now(),tag:'SYNC',peak:price};
           log(`[SYNC] Posição registrada: ${symbol} $${(qty*price).toFixed(2)}`);
         }
@@ -204,7 +204,16 @@ async function sell(symbol, pos, reason) {
   totalPnL+=pnl; freeUSDT+=pos.usdt+pnl;
   log(`[${pos.tag}][${PAPER_MODE?'SIM':'REAL'}] SELL ${symbol} @ $${price.toFixed(6)} | ${pct.toFixed(2)}% | $${pnl.toFixed(2)} | ${reason}`);
   if (!PAPER_MODE) {
-    try { await signedPost('/api/v3/order',{symbol,side:'SELL',type:'MARKET',quantity:pos.qty}); }
+    try {
+      // Get actual balance from Binance for accurate qty
+      const asset = symbol.replace('USDT','');
+      const acct  = await signedGet('/api/v3/account');
+      const bal   = acct.balances.find(b=>b.asset===asset);
+      const realQty = bal ? parseFloat(bal.free) : pos.qty;
+      const adjQty  = await getAdjQty(symbol, realQty);
+      if (!adjQty || adjQty<=0) { log(`Skip venda ${symbol}: qty inválida`); return false; }
+      await signedPost('/api/v3/order',{symbol,side:'SELL',type:'MARKET',quantity:adjQty});
+    }
     catch(e) { log(`Erro venda ${symbol}: ${e.response?.data?.msg||e.message}`); return false; }
   }
   tradeCount++;
@@ -252,7 +261,10 @@ async function manageHolds() {
 // ── MANAGE ACTIVE POSITIONS ───────────────────────────
 async function manageActive() {
   for (const symbol of [...Object.keys(activePos)]) {
-    const pos=activePos[symbol], price=await getPrice(symbol);
+    if (!activePos[symbol]) continue; // may have been deleted
+    const pos=activePos[symbol];
+    if (!pos || !pos.entryPrice) continue;
+    const price=await getPrice(symbol);
     if (!price) continue;
     const pct=((price-pos.entryPrice)/pos.entryPrice)*100;
 
@@ -317,9 +329,10 @@ async function rotateIfNeeded(minUSDT=2) {
   
   for (const item of ranked.slice(0,3)) {
     if (freeUSDT>=minUSDT) break;
+    if (!item.pos || item.pos.usdt<1) continue; // skip tiny positions
     log(`[ROTATE] Vendendo ${item.sym} (${item.pct.toFixed(2)}%) para liberar capital`);
-    await sell(item.sym,item.pos,`Rotação capital (${item.pct.toFixed(2)}%)`);
-    delete activePos[item.sym];
+    const sold = await sell(item.sym,item.pos,`Rotação capital (${item.pct.toFixed(2)}%)`);
+    if (sold) delete activePos[item.sym];
     await new Promise(r=>setTimeout(r,300));
   }
 }
@@ -335,8 +348,10 @@ async function sellWorstBuyBest() {
     if (pct<worstPct) { worstPct=pct; worstSym=sym; worstPos=pos; }
   }
 
-  // Sell worst if it's underperforming (< -1% or been held > 30min without profit)
-  if (worstSym && (worstPct<-1 || (Date.now()-worstPos.ts>1800000 && worstPct<1))) {
+  // Sell worst if it's underperforming AND worth at least $0.50
+  const worstPrice = worstSym ? await getPrice(worstSym) : 0;
+  const worstVal   = worstPos ? (worstPos.qty||0)*(worstPrice||0) : 0;
+  if (worstSym && worstVal>=0.50 && (worstPct<-1 || (Date.now()-worstPos.ts>1800000 && worstPct<1))) {
     log(`[ROTATE] Vendendo pior: ${worstSym} (${worstPct.toFixed(2)}%)`);
     await sell(worstSym,worstPos,`Rotação: pior posição ${worstPct.toFixed(2)}%`);
     delete activePos[worstSym];
