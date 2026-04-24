@@ -43,28 +43,56 @@ async function notify(title, body) {
 }
 
 // ── API with rate limit protection ───────────────────
+let rateLimitedUntil = 0;
+
+async function waitIfRateLimited() {
+  const now = Date.now();
+  if (now < rateLimitedUntil) {
+    const wait = rateLimitedUntil - now;
+    log(`Rate limit ativo — aguardando ${(wait/1000).toFixed(0)}s...`);
+    await new Promise(r=>setTimeout(r,wait));
+  }
+  await new Promise(r=>setTimeout(r,150)); // 150ms between calls
+}
+
+function handleRateLimit(e) {
+  const status = e.response?.status;
+  if (status===418 || status===429) {
+    const retryAfter = parseInt(e.response?.headers?.['retry-after']||'60');
+    rateLimitedUntil = Date.now() + (retryAfter * 1000);
+    log(`⚠️ Rate limit ${status} — aguardando ${retryAfter}s`);
+  }
+  throw e;
+}
+
 async function apiGet(path, params={}) {
-  await new Promise(r=>setTimeout(r,100)); // 100ms between calls
-  const r = await axios.get(BASE+path,{params,timeout:10000});
-  return r.data;
+  await waitIfRateLimited();
+  try {
+    const r = await axios.get(BASE+path,{params,timeout:10000});
+    return r.data;
+  } catch(e) { handleRateLimit(e); }
 }
 
 async function signedGet(path, params={}) {
-  await new Promise(r=>setTimeout(r,100));
-  const ts  = Date.now();
-  const q   = Object.entries({...params,timestamp:ts}).map(([k,v])=>`${k}=${v}`).join('&');
-  const sig = crypto.createHmac('sha256',API_SECRET).update(q).digest('hex');
-  const r   = await axios.get(`${BASE}${path}?${q}&signature=${sig}`,{headers:{'X-MBX-APIKEY':API_KEY},timeout:10000});
-  return r.data;
+  await waitIfRateLimited();
+  try {
+    const ts  = Date.now();
+    const q   = Object.entries({...params,timestamp:ts}).map(([k,v])=>`${k}=${v}`).join('&');
+    const sig = crypto.createHmac('sha256',API_SECRET).update(q).digest('hex');
+    const r   = await axios.get(`${BASE}${path}?${q}&signature=${sig}`,{headers:{'X-MBX-APIKEY':API_KEY},timeout:10000});
+    return r.data;
+  } catch(e) { handleRateLimit(e); }
 }
 
 async function signedPost(path, params={}) {
-  await new Promise(r=>setTimeout(r,100));
-  const ts  = Date.now();
-  const q   = Object.entries({...params,timestamp:ts}).map(([k,v])=>`${k}=${v}`).join('&');
-  const sig = crypto.createHmac('sha256',API_SECRET).update(q).digest('hex');
-  const r   = await axios.post(`${BASE}${path}?${q}&signature=${sig}`,null,{headers:{'X-MBX-APIKEY':API_KEY},timeout:10000});
-  return r.data;
+  await waitIfRateLimited();
+  try {
+    const ts  = Date.now();
+    const q   = Object.entries({...params,timestamp:ts}).map(([k,v])=>`${k}=${v}`).join('&');
+    const sig = crypto.createHmac('sha256',API_SECRET).update(q).digest('hex');
+    const r   = await axios.post(`${BASE}${path}?${q}&signature=${sig}`,null,{headers:{'X-MBX-APIKEY':API_KEY},timeout:10000});
+    return r.data;
+  } catch(e) { handleRateLimit(e); }
 }
 
 // ── BATCH PRICE FETCH — one call for all positions ───
@@ -328,6 +356,6 @@ server.listen(PORT, async()=>{
   await updateRankings();
   await notify('capital. 🚀 Bot v12!',`Capital: $${startBalance.toFixed(2)}\nTop ${TOP_N} momentum`);
   // Single loop every 15 seconds — efficient, no rate limits
-  setInterval(runBot, 15000);
+  setInterval(runBot, 20000);
   runBot();
 });
