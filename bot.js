@@ -23,6 +23,7 @@ const BUY_CH1H   = 8;    // or +8% in 1h
 const BUY_CH1M   = 8;    // or +8% in 1min
 const BUY_DIP    = -5;   // buy dip if -5% in 1h + RSI < 35
 const MIN_VOL    = 50000; // min $50k volume
+const MIN_TRADE  = 10;    // minimum $10 per trade
 
 // Sell signals — any timeframe
 const SELL_DROP24H = -10; // sell if -10% in 24h
