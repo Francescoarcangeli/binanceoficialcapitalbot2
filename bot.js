@@ -40,7 +40,7 @@ const ROTATE_PCT    = 2;       // rotate if new coin 2% better score
 const MIN_HOLD_MS   = 300000;  // hold at least 5min before rotating
 const BET_DAYS      = 7;
 const BET_EMERGENCY = -25;     // only sell bet at -25%
-const CYCLE_MS      = 300000;  // analyze every 5 minutes
+const CYCLE_MS      = 120000;  // 2 minutes  // analyze every 5 minutes
 
 // ── STATE ─────────────────────────────────────────────
 let freeUSDT=0, totalBalance=0, startBalance=0;
