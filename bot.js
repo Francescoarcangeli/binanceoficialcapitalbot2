@@ -1,28 +1,19 @@
 /**
- * capital. Bot v14
+ * capital. Bot v15
+ * 
+ * LÓGICA:
+ * A cada 5 minutos analisa TODAS as coins
+ * Compra as que estão acelerando (momentum crescente)
+ * Segura enquanto estiver subindo
+ * Vende quando começar a cair (trailing stop)
+ * Rotaciona automaticamente para coins melhores
  * 
  * ALOCAÇÃO:
- * 30% → Hold (BTC + ETH + SOL)
- * 40% → #1 coin mais quente
- * 20% → #2 coin mais quente  
- * 10% → #3 coin mais quente
- * 10% → Aposta semanal (bot escolhe, intocável 7 dias)
- * 
- * COMO DEFINE "MAIS QUENTE":
- * Score = (variação 1h × 4) + (variação 24h × 2) + (aceleração 5min × 5)
- * Apenas coins com volume > $2M (coins reais)
- * 
- * QUANDO ROTACIONA:
- * Se nova coin tem score 20% melhor que a atual → rotaciona
- * Nunca vende com < 3min de posição (evita churning)
- * 
- * APOSTA SEMANAL:
- * Analisa notícias + momentum 7d + volume crescente
- * Fica 7 dias intocável mesmo se cair
- * 
- * RATE LIMIT:
- * Apenas 3 tipos de chamadas: getAllTickers, getAccount, placeOrder
- * Ciclo de 30s, sem chamadas paralelas desnecessárias
+ * 30% Hold BTC/ETH/SOL
+ * 40% #1 coin com mais momentum
+ * 20% #2 coin com mais momentum  
+ * 10% #3 coin com mais momentum
+ * 10% Aposta semanal (intocável 7 dias)
  */
 
 const http   = require('http');
@@ -33,516 +24,467 @@ const API_KEY    = process.env.BINANCE_API_KEY    || '';
 const API_SECRET = process.env.BINANCE_API_SECRET || '';
 const PAPER_MODE = process.env.PAPER_MODE !== 'false';
 const NOTIFY_URL = process.env.NOTIFY_URL || '';
-const NEWS_KEY   = '8c729e78ee7e477295c572995346f88f';
 const PORT       = process.env.PORT || 3000;
 const BASE       = 'https://api.binance.com';
 
-// ── ALLOCATION ───────────────────────────────────────
 const HOLD_COINS = ['BTCUSDT','ETHUSDT','SOLUSDT'];
-const ALLOC = {
-  hold:  0.30,  // BTC+ETH+SOL
-  rank1: 0.40,  // #1 hottest
-  rank2: 0.20,  // #2 hottest
-  rank3: 0.10,  // #3 hottest
-  bet:   0.10,  // weekly bet
-};
+const ALLOC = {hold:0.40, r1:0.30, r2:0.15, r3:0.05, bet:0.10};
+const MIN_VOL       = 2000000;
+const MIN_TRADE     = 5;
+const HOLD_TP       = 20;
+const HOLD_SL       = 12;
+const RANK_SL       = 8;       // hard stop -8%
+const TRAIL_START   = 4;       // trailing starts after +4%
+const TRAIL_DROP    = 2;       // sell if -2% from peak
+const ROTATE_PCT    = 2;       // rotate if new coin 2% better score
+const MIN_HOLD_MS   = 300000;  // hold at least 5min before rotating
+const BET_DAYS      = 7;
+const BET_EMERGENCY = -25;     // only sell bet at -25%
+const CYCLE_MS      = 300000;  // analyze every 5 minutes
 
-// ── RULES ────────────────────────────────────────────
-const MIN_VOL        = 2000000;  // $2M min volume
-const MIN_TRADE      = 5;
-const ROTATE_THRESH  = 0.02;    // rotate if new coin score 2% better
-const MIN_HOLD_MS    = 180000;  // hold at least 3 min before selling
-const BET_HOLD_MS    = 604800000; // 7 days
-const HOLD_TP        = 20;
-const HOLD_SL        = 12;
-const RANK_SL        = 8;       // stop ranked position at -8%
-const CYCLE_MS       = 30000;   // 30 second cycle
-
-// ── STATE ────────────────────────────────────────────
-let freeUSDT       = 0;
-let totalBalance   = 0;
-let startBalance   = 0;
-let holdPos        = {};
-let rankPos        = {};   // {1: pos, 2: pos, 3: pos}
-let betPos         = null; // weekly bet position
-let totalPnL       = 0;
-let tradeCount     = 0;
-let paused         = false;
-let lastCycle      = null;
-let running        = false;
-let rateLimitUntil = 0;
-let lastTickers    = [];  // cache all tickers
-let lastTickersTs  = 0;
+// ── STATE ─────────────────────────────────────────────
+let freeUSDT=0, totalBalance=0, startBalance=0;
+let holdPos={}, rankPos={1:null,2:null,3:null}, betPos=null;
+let totalPnL=0, tradeCount=0;
+let paused=false, lastCycle=null, running=false;
+let rateLimitUntil=0;
 
 const log = msg => console.log(`[${new Date().toLocaleString('pt-BR',{timeZone:'America/Sao_Paulo'})}] ${msg}`);
 
-async function notify(title, body) {
+async function notify(t,b) {
   if (!NOTIFY_URL) return;
-  try { await axios.post(NOTIFY_URL+'/test-send',{title,body},{timeout:5000}); } catch(e){}
+  try { await axios.post(NOTIFY_URL+'/test-send',{title:t,body:b},{timeout:5000}); } catch(e){}
 }
 
-// ── HTTP with rate limit protection ──────────────────
-async function http_get(url, headers={}) {
-  if (Date.now() < rateLimitUntil) {
-    const w = rateLimitUntil - Date.now();
-    log(`⏳ Aguardando rate limit: ${Math.ceil(w/1000)}s`);
+// ── HTTP ──────────────────────────────────────────────
+async function apiGet(url, headers={}) {
+  if (Date.now()<rateLimitUntil) {
+    const w=rateLimitUntil-Date.now();
+    log(`⏳ Rate limit ${Math.ceil(w/1000)}s`);
     await new Promise(r=>setTimeout(r,w));
   }
-  try {
-    const r = await axios.get(url, {headers, timeout:15000});
-    return r.data;
-  } catch(e) {
+  try { return (await axios.get(url,{headers,timeout:15000})).data; }
+  catch(e) {
     if (e.response?.status===418||e.response?.status===429) {
-      const t = parseInt(e.response?.headers?.['retry-after']||'120');
-      rateLimitUntil = Date.now()+t*1000;
-      log(`🚫 Rate limit ${e.response.status} — bloqueado ${t}s`);
+      const t=parseInt(e.response?.headers?.['retry-after']||'60');
+      rateLimitUntil=Date.now()+t*1000;
+      log(`🚫 Rate limit ${t}s`);
       return null;
     }
     return null;
   }
 }
 
-async function http_post(url, headers={}) {
-  if (Date.now() < rateLimitUntil) {
-    await new Promise(r=>setTimeout(r,rateLimitUntil-Date.now()));
-  }
-  try {
-    const r = await axios.post(url, null, {headers, timeout:15000});
-    return r.data;
-  } catch(e) {
-    if (e.response?.status===418||e.response?.status===429) {
-      rateLimitUntil = Date.now()+120000;
-      log(`🚫 Rate limit POST — bloqueado 120s`);
-      return null;
-    }
-    log(`Erro POST: ${e.response?.data?.msg||e.message}`);
+async function apiPost(url, headers={}) {
+  if (Date.now()<rateLimitUntil) await new Promise(r=>setTimeout(r,rateLimitUntil-Date.now()));
+  try { return (await axios.post(url,null,{headers,timeout:15000})).data; }
+  catch(e) {
+    if (e.response?.status===418||e.response?.status===429) { rateLimitUntil=Date.now()+60000; return null; }
+    log(`Order erro: ${e.response?.data?.msg||e.message}`);
     return null;
   }
 }
 
-function buildUrl(path, params={}, signed=false) {
-  const entries = Object.entries(params);
-  if (signed) entries.push(['timestamp', Date.now()]);
-  const qs = entries.map(([k,v])=>`${k}=${v}`).join('&');
-  if (!signed) return `${BASE}${path}${qs?'?'+qs:''}`;
-  const sig = crypto.createHmac('sha256',API_SECRET).update(qs).digest('hex');
-  return `${BASE}${path}?${qs}&signature=${sig}`;
+function sign(p={}) {
+  const ts=Date.now();
+  const q=Object.entries({...p,timestamp:ts}).map(([k,v])=>`${k}=${v}`).join('&');
+  return q+'&signature='+crypto.createHmac('sha256',API_SECRET).update(q).digest('hex');
 }
 
-const AUTH = {'X-MBX-APIKEY': API_KEY};
+const H={'X-MBX-APIKEY':API_KEY};
 
-// ── GET ALL TICKERS (cached 20s) ──────────────────────
-async function getTickers() {
-  if (Date.now()-lastTickersTs < 20000 && lastTickers.length > 0) return lastTickers;
-  const data = await http_get(buildUrl('/api/v3/ticker/24hr'));
-  if (data) { lastTickers=data; lastTickersTs=Date.now(); }
-  return lastTickers;
+// ── CORE: SCORE MOMENTUM ──────────────────────────────
+// Gets 12 candles of 5min = last hour
+// Calculates acceleration, trend consistency, recent spike
+async function scoreMomentum(symbol) {
+  try {
+    const k=await apiGet(`${BASE}/api/v3/klines?symbol=${symbol}&interval=5m&limit=12`);
+    if (!k||k.length<6) return null;
+
+    const closes=k.map(c=>parseFloat(c[4]));
+    const vols=k.map(c=>parseFloat(c[5]));
+    const n=closes.length;
+
+    // 5min change (last candle)
+    const ch5m=((closes[n-1]-closes[n-2])/closes[n-2])*100;
+    // 10min change
+    const ch10m=((closes[n-1]-closes[n-3])/closes[n-3])*100;
+    // 30min change
+    const ch30m=((closes[n-1]-closes[n-7])/closes[n-7])*100;
+    // 60min change
+    const ch60m=((closes[n-1]-closes[0])/closes[0])*100;
+
+    // Consistency: how many of last 6 candles were green
+    let greenCount=0;
+    for (let i=n-6;i<n;i++) { if(closes[i]>closes[i-1]) greenCount++; }
+    const consistency=greenCount/6; // 0 to 1
+
+    // Volume acceleration: is volume increasing?
+    const avgVolEarly=(vols[0]+vols[1]+vols[2])/3;
+    const avgVolRecent=(vols[n-3]+vols[n-2]+vols[n-1])/3;
+    const volAccel=avgVolRecent/avgVolEarly; // >1 means increasing
+
+    // SCORE: weight recent momentum most
+    // Coins going up slowly but consistently score well
+    // Coins spiking recently also score well
+    const score = (ch5m*5) + (ch10m*3) + (ch30m*1.5) + (ch60m*0.5)
+                + (consistency*10)  // bonus for consistent uptrend
+                + (Math.min(volAccel,3)*3); // bonus for volume growth, max 3x
+
+    return {symbol, score, ch5m, ch10m, ch30m, ch60m, consistency, volAccel};
+  } catch(e) { return null; }
 }
 
-async function getPrice(symbol) {
-  const tickers = await getTickers();
-  const t = tickers.find(t=>t.symbol===symbol);
-  return t ? parseFloat(t.lastPrice) : 0;
+// ── FIND TOP COINS ────────────────────────────────────
+async function findTopCoins() {
+  log('🔍 Analisando mercado...');
+
+  // Step 1: get all tickers, filter by volume and positive 24h
+  const tickers=await apiGet(`${BASE}/api/v3/ticker/24hr`);
+  if (!tickers) return [];
+
+  const exclude=new Set([...HOLD_COINS, betPos?.symbol].filter(Boolean));
+
+  const candidates=tickers
+    .filter(t=>
+      t.symbol.endsWith('USDT') &&
+      !exclude.has(t.symbol) &&
+      parseFloat(t.quoteVolume)>=MIN_VOL &&
+      parseFloat(t.priceChangePercent)>0 &&
+      parseFloat(t.priceChangePercent)<500
+    )
+    .sort((a,b)=>parseFloat(b.priceChangePercent)-parseFloat(a.priceChangePercent))
+    .slice(0,40); // analyze top 40 by 24h
+
+  // Step 2: score each by momentum (5min candles)
+  log(`Calculando momentum de ${candidates.length} coins...`);
+  const scored=[];
+  for (const t of candidates) {
+    await new Promise(r=>setTimeout(r,150)); // 150ms between calls
+    const s=await scoreMomentum(t.symbol);
+    if (s && s.score>0) scored.push({
+      ...s,
+      ch24h:parseFloat(t.priceChangePercent),
+      vol:parseFloat(t.quoteVolume)
+    });
+  }
+
+  // Sort by score descending
+  scored.sort((a,b)=>b.score-a.score);
+
+  if (scored.length>0) {
+    log(`🔥 Top momentum:`);
+    for (const c of scored.slice(0,5)) {
+      log(`  ${c.symbol.replace('USDT','')}: score=${c.score.toFixed(1)} 5m=${c.ch5m>=0?'+':''}${c.ch5m.toFixed(2)}% 30m=${c.ch30m>=0?'+':''}${c.ch30m.toFixed(2)}% consist=${(c.consistency*100).toFixed(0)}%`);
+    }
+  }
+
+  return scored;
 }
 
-// ── BALANCE ──────────────────────────────────────────
+// ── FIND WEEKLY BET ───────────────────────────────────
+async function findWeeklyBet(topCoins) {
+  // Bet on a coin that is:
+  // - NOT in top 3 (those are already pumping)
+  // - Has strong volume growth (building interest)
+  // - Gaining steadily (not spiked and dropping)
+  // - Between 5-40% gains in 24h (not overheated)
+  const rankSymbols=new Set(Object.values(rankPos).filter(Boolean).map(p=>p.symbol));
+
+  const tickers=await apiGet(`${BASE}/api/v3/ticker/24hr`);
+  if (!tickers) return null;
+
+  const bets=tickers
+    .filter(t=>{
+      if (!t.symbol.endsWith('USDT')) return false;
+      if (HOLD_COINS.includes(t.symbol)) return false;
+      if (rankSymbols.has(t.symbol)) return false;
+      const ch=parseFloat(t.priceChangePercent);
+      const vol=parseFloat(t.quoteVolume);
+      // Sweet spot: 5-40% gain, $5M+ volume
+      return ch>=5 && ch<=40 && vol>=5000000;
+    })
+    .map(t=>{
+      const ch24h=parseFloat(t.priceChangePercent);
+      const vol=parseFloat(t.quoteVolume);
+      const last=parseFloat(t.lastPrice);
+      const high=parseFloat(t.highPrice);
+      const distFromHigh=((high-last)/high)*100;
+      // Score: prefer coins NOT at peak (room to grow) + high volume
+      const score=(ch24h)+(distFromHigh>10?8:0)+(Math.log10(vol)*2);
+      return {symbol:t.symbol, ch24h, vol, distFromHigh, score};
+    })
+    .sort((a,b)=>b.score-a.score)
+    .slice(0,3);
+
+  if (!bets.length) return null;
+  const pick=bets[0];
+  log(`[BET] Escolhendo ${pick.symbol} — +${pick.ch24h.toFixed(1)}% 24h, ${pick.distFromHigh.toFixed(1)}% abaixo do topo, vol $${(pick.vol/1e6).toFixed(0)}M`);
+  return pick;
+}
+
+// ── BALANCE ───────────────────────────────────────────
 async function fetchBalance() {
-  const data = await http_get(buildUrl('/api/v3/account',{},true), AUTH);
-  if (!data) return;
-  let usdt=0, total=0;
-  const tickers = await getTickers();
-  const priceMap = {};
-  for (const t of tickers) priceMap[t.symbol]=parseFloat(t.lastPrice);
-  for (const b of data.balances) {
-    const qty = parseFloat(b.free)+parseFloat(b.locked);
+  const d=await apiGet(`${BASE}/api/v3/account?${sign()}`,H);
+  if (!d) return;
+  let usdt=0,total=0;
+  const prices={};
+  for (const t of (await apiGet(`${BASE}/api/v3/ticker/price`)||[])) prices[t.symbol]=parseFloat(t.price);
+  for (const b of d.balances) {
+    const qty=parseFloat(b.free)+parseFloat(b.locked);
     if (qty<=0) continue;
     if (b.asset==='USDT') { usdt=parseFloat(b.free); total+=qty; continue; }
     if (['BRL','EUR','GBP','BUSD','USDC'].includes(b.asset)) continue;
-    const p = priceMap[b.asset+'USDT']||0;
+    const p=prices[b.asset+'USDT']||0;
     if (p>0) total+=qty*p;
   }
   freeUSDT=usdt; totalBalance=total;
   log(`💰 $${total.toFixed(2)} | USDT: $${usdt.toFixed(2)}`);
 }
 
-// ── LOT SIZE ─────────────────────────────────────────
-async function getQty(symbol, usdtAmt) {
-  const price = await getPrice(symbol);
-  if (!price) return 0;
-  const rawQty = usdtAmt / price;
-  // Use simple rounding based on price — avoids extra API call
-  let qty;
-  if (price > 10000) qty = parseFloat(rawQty.toFixed(5));
-  else if (price > 100) qty = parseFloat(rawQty.toFixed(3));
-  else if (price > 1)   qty = parseFloat(rawQty.toFixed(2));
-  else if (price > 0.01) qty = parseFloat(rawQty.toFixed(0));
-  else qty = Math.floor(rawQty);
-  return qty > 0 ? qty : 0;
+async function getPrice(symbol) {
+  const d=await apiGet(`${BASE}/api/v3/ticker/price?symbol=${symbol}`);
+  return d?parseFloat(d.price):0;
 }
 
-// ── BUY / SELL ────────────────────────────────────────
-async function buy(symbol, usdtAmt, tag) {
-  if (!usdtAmt||usdtAmt<MIN_TRADE||isNaN(usdtAmt)) return null;
-  if (freeUSDT < usdtAmt*0.98) {
-    log(`[${tag}] Sem USDT: $${freeUSDT.toFixed(2)} < $${usdtAmt.toFixed(2)}`);
-    return null;
-  }
-  const price = await getPrice(symbol);
-  if (!price) return null;
-  const qty = await getQty(symbol, usdtAmt);
-  if (!qty) return null;
+async function getQty(symbol, usdtAmt) {
+  const p=await getPrice(symbol);
+  if (!p) return 0;
+  const raw=usdtAmt/p;
+  if (p>10000) return parseFloat(raw.toFixed(5));
+  if (p>1000)  return parseFloat(raw.toFixed(4));
+  if (p>100)   return parseFloat(raw.toFixed(3));
+  if (p>10)    return parseFloat(raw.toFixed(2));
+  if (p>1)     return parseFloat(raw.toFixed(1));
+  return Math.floor(raw);
+}
 
-  log(`[BUY][${tag}] ${symbol} ~$${usdtAmt.toFixed(2)} qty:${qty}`);
-
+// ── BUY ───────────────────────────────────────────────
+async function buy(symbol, amt, tag) {
+  if (!amt||amt<MIN_TRADE||freeUSDT<amt*0.98) return null;
+  const qty=await getQty(symbol,amt);
+  if (!qty||qty<=0) return null;
+  const price=await getPrice(symbol);
+  log(`[BUY][${tag}] ${symbol} ~$${amt.toFixed(2)}`);
   if (!PAPER_MODE) {
-    const r = await http_post(buildUrl('/api/v3/order',{symbol,side:'BUY',type:'MARKET',quantity:qty},true), AUTH);
+    const r=await apiPost(`${BASE}/api/v3/order?${sign({symbol,side:'BUY',type:'MARKET',quantity:qty})}`,H);
     if (!r) return null;
   }
-
-  freeUSDT -= usdtAmt;
-  tradeCount++;
-  await notify(`🟢 [${tag}] ${symbol.replace('USDT','')}`, `$${usdtAmt.toFixed(2)} @ $${price.toFixed(4)}`);
-  return {symbol, entryPrice:price, qty, usdt:usdtAmt, ts:Date.now(), tag, peak:price};
+  freeUSDT-=amt; tradeCount++;
+  await notify(`🟢 [${tag}] ${symbol.replace('USDT','')}`,`$${amt.toFixed(2)} @ $${price.toFixed(4)}`);
+  return {symbol,entryPrice:price,qty,usdt:amt,ts:Date.now(),tag,peak:price};
 }
 
+// ── SELL ──────────────────────────────────────────────
 async function sell(symbol, pos, reason) {
-  if (!pos||!pos.entryPrice||!pos.qty) return false;
-  const price = await getPrice(symbol);
+  if (!pos?.entryPrice||!pos?.qty) return false;
+  const price=await getPrice(symbol);
   if (!price) return false;
-  const pct = ((price-pos.entryPrice)/pos.entryPrice)*100;
-  const pnl = pos.usdt*(pct/100);
-
+  const pct=((price-pos.entryPrice)/pos.entryPrice)*100;
+  const pnl=pos.usdt*(pct/100);
   log(`[SELL][${pos.tag}] ${symbol} ${pct>=0?'+':''}${pct.toFixed(2)}% $${pnl>=0?'+':''}${pnl.toFixed(2)} | ${reason}`);
-
   if (!PAPER_MODE) {
-    const r = await http_post(buildUrl('/api/v3/order',{symbol,side:'SELL',type:'MARKET',quantity:pos.qty},true), AUTH);
+    const r=await apiPost(`${BASE}/api/v3/order?${sign({symbol,side:'SELL',type:'MARKET',quantity:pos.qty})}`,H);
     if (!r) return false;
   }
-
   totalPnL+=pnl; freeUSDT+=pos.usdt+pnl; tradeCount++;
-  const roi = startBalance>0?((totalPnL/startBalance)*100).toFixed(1):'0';
+  const roi=startBalance>0?((totalPnL/startBalance)*100).toFixed(1):'0';
   await notify(`${pnl>=0?'📈':'📉'} [${pos.tag}] ${symbol.replace('USDT','')}`,
     `${pct>=0?'+':''}${pct.toFixed(2)}% | $${pnl>=0?'+':''}${pnl.toFixed(2)}\nROI: ${roi}%`);
-
   if (startBalance>0) {
-    if (totalPnL<=-(startBalance*0.20)) { paused=true; notify('⛔ Bot pausado',`Perda: $${Math.abs(totalPnL).toFixed(2)}`); }
-    if (totalPnL>= startBalance*0.50)   { paused=true; notify('🏆 Meta atingida!',`Lucro: $${totalPnL.toFixed(2)}`); }
+    if (totalPnL<=-(startBalance*0.20)) { paused=true; notify('⛔ Bot pausado',`Perda $${Math.abs(totalPnL).toFixed(2)}`); }
+    if (totalPnL>= startBalance*0.50)   { paused=true; notify('🏆 Meta!',`Lucro $${totalPnL.toFixed(2)}`); }
   }
   return true;
 }
 
-// ── SELL WORST to free capital ────────────────────────
-async function freeCapital(needed) {
-  if (freeUSDT >= needed) return;
-  log(`Liberando capital (precisa $${needed.toFixed(2)}, tem $${freeUSDT.toFixed(2)})`);
-
-  // Find worst ranked position (never sell hold or bet)
-  let worstRank = null, worstPct = Infinity;
-  for (const [rank, pos] of Object.entries(rankPos)) {
+// ── FREE CAPITAL ──────────────────────────────────────
+async function freeCapital() {
+  if (freeUSDT>=MIN_TRADE*2) return;
+  // Sell worst ranked position
+  let worst=null, worstPct=Infinity, worstRank=null;
+  for (const [rank,pos] of Object.entries(rankPos)) {
     if (!pos) continue;
-    const price = await getPrice(pos.symbol);
+    if (Date.now()-pos.ts<MIN_HOLD_MS) continue;
+    const price=await getPrice(pos.symbol);
     if (!price) continue;
-    const pct = ((price-pos.entryPrice)/pos.entryPrice)*100;
-    const age = Date.now()-pos.ts;
-    if (age < MIN_HOLD_MS) continue; // too new
-    if (pct < worstPct) { worstPct=pct; worstRank=rank; }
+    const pct=((price-pos.entryPrice)/pos.entryPrice)*100;
+    if (pct<worstPct) { worstPct=pct; worst=pos; worstRank=rank; }
   }
-
-  if (worstRank) {
-    const pos = rankPos[worstRank];
-    log(`Vendendo pior posição: Rank ${worstRank} ${pos.symbol} (${worstPct.toFixed(2)}%)`);
-    const ok = await sell(pos.symbol, pos, `Liberando capital`);
-    if (ok) rankPos[worstRank] = null;
-  }
-}
-
-// ── SCORE COIN ────────────────────────────────────────
-function scoreCoin(ticker) {
-  const ch24h = parseFloat(ticker.priceChangePercent);
-  const ch1h  = ((parseFloat(ticker.lastPrice)-parseFloat(ticker.openPrice))/parseFloat(ticker.openPrice))*100;
-  const vol   = parseFloat(ticker.quoteVolume);
-  if (vol < MIN_VOL) return -Infinity;
-  if (ch24h < 0) return -Infinity; // must be going up
-  // Score weights recent momentum more
-  return (ch1h*4) + (ch24h*2) + Math.log10(vol)*0.5;
-}
-
-// ── GET TOP COINS ─────────────────────────────────────
-async function getTopCoins() {
-  const tickers = await getTickers();
-  if (!tickers.length) return [];
-
-  const exclude = new Set([...HOLD_COINS, betPos?.symbol].filter(Boolean));
-
-  const scored = tickers
-    .filter(t => t.symbol.endsWith('USDT') && !exclude.has(t.symbol))
-    .map(t => ({symbol:t.symbol, score:scoreCoin(t), ch24h:parseFloat(t.priceChangePercent), vol:parseFloat(t.quoteVolume)}))
-    .filter(t => t.score > -Infinity)
-    .sort((a,b) => b.score-a.score)
-    .slice(0, 10);
-
-  return scored;
-}
-
-// ── WEEKLY BET ────────────────────────────────────────
-// Strategy: find coins that are building momentum over days
-// NOT the hottest right now (already pumped), but coins with
-// sustained growth + high volume = likely to continue
-async function pickWeeklyBet(topCoins) {
-  const rankSymbols = new Set(Object.values(rankPos).filter(Boolean).map(p=>p.symbol));
-  const tickers = await getTickers();
-  
-  // Find coins with:
-  // 1. Strong 24h gain (5-30%) — not too much (already pumped), not too little
-  // 2. Very high volume (building interest)
-  // 3. Not already in our ranked positions
-  const candidates = tickers
-    .filter(t => {
-      if (!t.symbol.endsWith('USDT')) return false;
-      if (HOLD_COINS.includes(t.symbol)) return false;
-      if (rankSymbols.has(t.symbol)) return false;
-      const ch24h = parseFloat(t.priceChangePercent);
-      const vol   = parseFloat(t.quoteVolume);
-      // Sweet spot: gaining 5-50% in 24h with massive volume
-      // These are coins building momentum, not already peaked
-      return ch24h >= 5 && ch24h <= 50 && vol >= 5000000;
-    })
-    .map(t => {
-      const ch24h = parseFloat(t.priceChangePercent);
-      const vol   = parseFloat(t.quoteVolume);
-      const high  = parseFloat(t.highPrice);
-      const last  = parseFloat(t.lastPrice);
-      // Prefer coins NOT at their 24h high (more room to grow)
-      const distFromHigh = ((high-last)/high)*100;
-      // Score: volume matters most for weekly bet
-      const score = (ch24h * 1.5) + Math.log10(vol) + (distFromHigh > 5 ? 5 : 0);
-      return {symbol:t.symbol, ch24h, vol, score, distFromHigh};
-    })
-    .sort((a,b) => b.score - a.score)
-    .slice(0, 5);
-
-  if (!candidates.length) return null;
-  
-  // Pick the best candidate
-  const pick = candidates[0];
-  log(`[BET] Escolhendo ${pick.symbol} — +${pick.ch24h.toFixed(1)}% 24h, vol $${(pick.vol/1e6).toFixed(1)}M, ${pick.distFromHigh.toFixed(1)}% abaixo do topo`);
-  return pick;
-}
-
-// ── MANAGE HOLDS ─────────────────────────────────────
-async function manageHolds() {
-  const perCoin = totalBalance * ALLOC.hold / HOLD_COINS.length;
-  for (const symbol of [...Object.keys(holdPos)]) {
-    if (!holdPos[symbol]) continue;
-    const pos = holdPos[symbol];
-    const price = await getPrice(symbol);
-    if (!price) continue;
-    const pct = ((price-pos.entryPrice)/pos.entryPrice)*100;
-    log(`[HOLD] ${symbol} ${pct>=0?'+':''}${pct.toFixed(2)}%`);
-    if (pct>=HOLD_TP) {
-      await sell(symbol,pos,`TP +${pct.toFixed(1)}%`); delete holdPos[symbol];
-      await new Promise(r=>setTimeout(r,1000));
-      const p=await buy(symbol,Math.min(perCoin,freeUSDT*0.95),'HOLD');
-      if (p) holdPos[symbol]=p;
-    } else if (pct<=-HOLD_SL) {
-      await sell(symbol,pos,`SL ${pct.toFixed(1)}%`); delete holdPos[symbol];
-    }
-  }
-  for (const symbol of HOLD_COINS) {
-    if (holdPos[symbol]) continue;
-    const amt = Math.min(perCoin, freeUSDT*0.9);
-    if (amt<MIN_TRADE) continue;
-    const p = await buy(symbol,amt,'HOLD');
-    if (p) holdPos[symbol]=p;
-    await new Promise(r=>setTimeout(r,500));
-  }
-}
-
-// ── MANAGE RANKED POSITIONS ───────────────────────────
-async function manageRanked(topCoins) {
-  const allocations = [
-    {rank:1, pct:ALLOC.rank1},
-    {rank:2, pct:ALLOC.rank2},
-    {rank:3, pct:ALLOC.rank3},
-  ];
-
-  for (let i=0; i<allocations.length; i++) {
-    const {rank, pct} = allocations[i];
-    const targetCoin = topCoins[i];
-    const current = rankPos[rank];
-
-    if (!targetCoin) continue;
-
-    // Check if current position needs stop loss
-    if (current) {
-      const price = await getPrice(current.symbol);
-      if (price) {
-        const pctChange = ((price-current.entryPrice)/current.entryPrice)*100;
-        if (current.peak < price) rankPos[rank].peak = price;
-        const fromPeak = ((price-current.peak)/current.peak)*100;
-
-        // Stop loss
-        if (pctChange <= -RANK_SL) {
-          log(`[RANK${rank}] SL ${pctChange.toFixed(2)}% — vendendo ${current.symbol}`);
-          const ok = await sell(current.symbol, current, `SL ${pctChange.toFixed(2)}%`);
-          if (ok) { rankPos[rank]=null; await new Promise(r=>setTimeout(r,500)); }
-        }
-        // Trailing stop after +5%
-        else if (pctChange>=5 && fromPeak<=-2) {
-          log(`[RANK${rank}] Trailing ${fromPeak.toFixed(2)}% from peak — vendendo ${current.symbol}`);
-          const ok = await sell(current.symbol, current, `Trailing peak:${fromPeak.toFixed(2)}%`);
-          if (ok) { rankPos[rank]=null; await new Promise(r=>setTimeout(r,500)); }
-        }
-        else {
-          log(`[RANK${rank}] ${current.symbol} ${pctChange>=0?'+':''}${pctChange.toFixed(2)}%`);
-        }
-      }
-    }
-
-    // Should we rotate to better coin?
-    const currentAfterCheck = rankPos[rank];
-    if (currentAfterCheck) {
-      const currentScore = topCoins.find(t=>t.symbol===currentAfterCheck.symbol)?.score || 0;
-      const newScore = targetCoin.score;
-      const age = Date.now()-currentAfterCheck.ts;
-      const betterByThresh = newScore > currentScore * (1+ROTATE_THRESH);
-      const differentCoin = currentAfterCheck.symbol !== targetCoin.symbol;
-
-      if (differentCoin && betterByThresh && age>MIN_HOLD_MS) {
-        log(`[RANK${rank}] Rotacionando ${currentAfterCheck.symbol} → ${targetCoin.symbol} (score ${currentScore.toFixed(1)} → ${newScore.toFixed(1)})`);
-        const ok = await sell(currentAfterCheck.symbol, currentAfterCheck, `Rotação para ${targetCoin.symbol}`);
-        if (ok) { rankPos[rank]=null; await new Promise(r=>setTimeout(r,500)); }
-      }
-    }
-
-    // Buy if empty
-    if (!rankPos[rank]) {
-      await freeCapital(totalBalance*pct*0.5);
-      const amt = Math.min(totalBalance*pct, freeUSDT*0.95);
-      if (amt<MIN_TRADE) { log(`Sem capital para rank ${rank}`); continue; }
-      const p = await buy(targetCoin.symbol, amt, `#${rank}`);
-      if (p) {
-        rankPos[rank] = p;
-        await notify(`🔥 #${rank} ${targetCoin.symbol.replace('USDT','')}`,
-          `+${targetCoin.ch24h.toFixed(1)}% 24h\nAlocando $${amt.toFixed(2)} (${(pct*100).toFixed(0)}%)`);
-      }
-      await new Promise(r=>setTimeout(r,500));
-    }
-  }
-}
-
-// ── MANAGE BET ────────────────────────────────────────
-async function manageBet(topCoins) {
-  // Check if bet exists and is still valid
-  if (betPos) {
-    const age = Date.now()-betPos.ts;
-    const price = await getPrice(betPos.symbol);
-    const pct = price ? ((price-betPos.entryPrice)/betPos.entryPrice)*100 : 0;
-    log(`[BET] ${betPos.symbol} ${pct>=0?'+':''}${pct.toFixed(2)}% (${Math.floor(age/86400000)}d)`);
-
-    // Hold for 7 days — only emergency exit at -30%
-    if (pct <= -30) {
-      log(`[BET] Stop emergência -30%`);
-      const ok = await sell(betPos.symbol, betPos, `Emergência -30%`);
-      if (ok) betPos = null;
-    }
-    return; // don't touch bet otherwise
-  }
-
-  // Pick new weekly bet
-  const candidate = await pickWeeklyBet(topCoins);
-  if (!candidate) return;
-
-  await freeCapital(totalBalance*ALLOC.bet*0.5);
-  const amt = Math.min(totalBalance*ALLOC.bet, freeUSDT*0.9);
-  if (amt<MIN_TRADE) return;
-
-  log(`[BET] Apostando em ${candidate.symbol} por 7 dias`);
-  const p = await buy(candidate.symbol, amt, 'BET');
-  if (p) {
-    betPos = p;
-    await notify(`🎯 Aposta semanal: ${candidate.symbol.replace('USDT','')}`,
-      `+${candidate.ch24h.toFixed(1)}% 24h\nIntocável por 7 dias\n$${amt.toFixed(2)}`);
+  if (worst) {
+    const ok=await sell(worst.symbol,worst,`Liberando capital (${worstPct.toFixed(2)}%)`);
+    if (ok) rankPos[worstRank]=null;
   }
 }
 
 // ── MAIN CYCLE ────────────────────────────────────────
 async function runBot() {
-  if (paused || running) return;
-  if (Date.now() < rateLimitUntil) return;
-  running = true;
-  lastCycle = new Date().toISOString();
+  if (paused||running) return;
+  running=true;
+  lastCycle=new Date().toISOString();
+  log(`\n${'═'.repeat(60)}`);
+  log(`Ciclo iniciado`);
 
   try {
     await fetchBalance();
-    if (totalBalance <= 0) { running=false; return; }
+    if (totalBalance<=0) { running=false; return; }
 
-    const topCoins = await getTopCoins();
-    if (topCoins.length < 3) { log('Poucos dados de mercado'); running=false; return; }
+    // ── HOLDS ──────────────────────────────────────────
+    const perHold=totalBalance*ALLOC.hold/HOLD_COINS.length;
+    for (const sym of [...Object.keys(holdPos)]) {
+      if (!holdPos[sym]) continue;
+      const price=await getPrice(sym);
+      if (!price) continue;
+      const pct=((price-holdPos[sym].entryPrice)/holdPos[sym].entryPrice)*100;
+      log(`[HOLD] ${sym} ${pct>=0?'+':''}${pct.toFixed(2)}%`);
+      if (pct>=HOLD_TP) { await sell(sym,holdPos[sym],`TP +${pct.toFixed(1)}%`); delete holdPos[sym]; }
+      else if (pct<=-HOLD_SL) { await sell(sym,holdPos[sym],`SL ${pct.toFixed(1)}%`); delete holdPos[sym]; }
+    }
+    for (const sym of HOLD_COINS) {
+      if (holdPos[sym]) continue;
+      const amt=Math.min(perHold,freeUSDT*0.9);
+      if (amt<MIN_TRADE) continue;
+      const p=await buy(sym,amt,'HOLD');
+      if (p) holdPos[sym]=p;
+    }
 
-    log(`🔥 Hot: ${topCoins.slice(0,5).map((c,i)=>`#${i+1} ${c.symbol.replace('USDT','')}(+${c.ch24h.toFixed(1)}%)`).join(' ')}`);
+    // ── FIND TOP COINS ─────────────────────────────────
+    const top=await findTopCoins();
+    if (!top.length) { running=false; return; }
 
-    await manageHolds();
-    await manageRanked(topCoins);
-    await manageBet(topCoins);
+    // ── CHECK EXISTING RANKED POSITIONS ────────────────
+    for (const [rank,pos] of Object.entries(rankPos)) {
+      if (!pos) continue;
+      const price=await getPrice(pos.symbol);
+      if (!price) continue;
 
-    const hi = Object.values(holdPos).reduce((s,p)=>s+(p?.usdt||0),0);
-    const ri = Object.values(rankPos).reduce((s,p)=>s+(p?.usdt||0),0);
-    const bi = betPos?.usdt||0;
-    const roi = startBalance>0?((totalPnL/startBalance)*100).toFixed(1):'0';
-    log(`=== PnL:$${totalPnL.toFixed(2)}(${roi}%) | USDT:$${freeUSDT.toFixed(2)} | Hold:$${hi.toFixed(0)} Ranked:$${ri.toFixed(0)} Bet:$${bi.toFixed(0)} ===`);
+      // Update peak
+      if (price>pos.peak) rankPos[rank].peak=price;
+      const pct=((price-pos.entryPrice)/pos.entryPrice)*100;
+      const fromPeak=((price-pos.peak)/pos.peak)*100;
+      const age=Date.now()-pos.ts;
 
-  } catch(e) { log(`Erro ciclo: ${e.message}`); }
-  running = false;
+      log(`[#${rank}] ${pos.symbol} ${pct>=0?'+':''}${pct.toFixed(2)}% peak:${fromPeak.toFixed(2)}%`);
+
+      let sellReason=null;
+      if (pct<=-RANK_SL) sellReason=`SL ${pct.toFixed(2)}%`;
+      else if (pct>=TRAIL_START&&fromPeak<=-TRAIL_DROP) sellReason=`Trailing +${pct.toFixed(2)}% peak:${fromPeak.toFixed(2)}%`;
+
+      if (sellReason) {
+        const ok=await sell(pos.symbol,pos,sellReason);
+        if (ok) rankPos[rank]=null;
+        continue;
+      }
+
+      // Rotate if better coin available
+      const newCoin=top[parseInt(rank)-1];
+      if (!newCoin) continue;
+      if (newCoin.symbol===pos.symbol) continue;
+      if (age<MIN_HOLD_MS) continue;
+
+      const currentScore=top.find(t=>t.symbol===pos.symbol)?.score||0;
+      const improvement=(newCoin.score-currentScore)/Math.abs(currentScore||1)*100;
+
+      if (improvement>=ROTATE_PCT) {
+        log(`[ROTATE] #${rank}: ${pos.symbol}(${currentScore.toFixed(0)}) → ${newCoin.symbol}(${newCoin.score.toFixed(0)}) +${improvement.toFixed(1)}%`);
+        const ok=await sell(pos.symbol,pos,`Rotação → ${newCoin.symbol}`);
+        if (ok) { rankPos[rank]=null; await new Promise(r=>setTimeout(r,500)); }
+      }
+    }
+
+    // ── BUY RANKED POSITIONS ───────────────────────────
+    const rankAllocs=[
+      {rank:'1',pct:ALLOC.r1,coin:top[0]},
+      {rank:'2',pct:ALLOC.r2,coin:top[1]},
+      {rank:'3',pct:ALLOC.r3,coin:top[2]},
+    ];
+
+    for (const {rank,pct,coin} of rankAllocs) {
+      if (!coin) continue;
+      if (rankPos[rank]) continue;
+      await freeCapital();
+      const amt=Math.min(totalBalance*pct, freeUSDT*0.95);
+      if (amt<MIN_TRADE) continue;
+      const p=await buy(coin.symbol,amt,`#${rank}`);
+      if (p) {
+        rankPos[rank]={...p,score:coin.score};
+        await notify(`🔥 #${rank} ${coin.symbol.replace('USDT','')}`,
+          `Score: ${coin.score.toFixed(0)} | 5m:${coin.ch5m>=0?'+':''}${coin.ch5m.toFixed(1)}% 30m:${coin.ch30m>=0?'+':''}${coin.ch30m.toFixed(1)}%\n$${amt.toFixed(2)} alocado`);
+      }
+      await new Promise(r=>setTimeout(r,500));
+    }
+
+    // ── WEEKLY BET ─────────────────────────────────────
+    if (!betPos) {
+      const bet=await findWeeklyBet(top);
+      if (bet) {
+        await freeCapital();
+        const amt=Math.min(totalBalance*ALLOC.bet,freeUSDT*0.9);
+        if (amt>=MIN_TRADE) {
+          const p=await buy(bet.symbol,amt,'BET');
+          if (p) {
+            betPos=p;
+            await notify(`🎯 Aposta 7d: ${bet.symbol.replace('USDT','')}`,
+              `+${bet.ch24h.toFixed(1)}% 24h | ${bet.distFromHigh.toFixed(1)}% abaixo do topo\nIntocável 7 dias | $${amt.toFixed(2)}`);
+          }
+        }
+      }
+    } else {
+      // Check bet emergency stop only
+      const price=await getPrice(betPos.symbol);
+      if (price) {
+        const pct=((price-betPos.entryPrice)/betPos.entryPrice)*100;
+        const age=Date.now()-betPos.ts;
+        log(`[BET] ${betPos.symbol} ${pct>=0?'+':''}${pct.toFixed(2)}% (${Math.floor(age/86400000)}d/${BET_DAYS}d)`);
+        if (pct<=BET_EMERGENCY) {
+          const ok=await sell(betPos.symbol,betPos,`Emergência ${pct.toFixed(2)}%`);
+          if (ok) betPos=null;
+        } else if (age>=BET_DAYS*86400000) {
+          // 7 days up — sell and pick new bet
+          const ok=await sell(betPos.symbol,betPos,`7 dias concluídos`);
+          if (ok) betPos=null;
+        }
+      }
+    }
+
+    // ── SUMMARY ────────────────────────────────────────
+    const hi=Object.values(holdPos).reduce((s,p)=>s+(p?.usdt||0),0);
+    const ri=Object.values(rankPos).reduce((s,p)=>s+(p?.usdt||0),0);
+    const bi=betPos?.usdt||0;
+    const roi=startBalance>0?((totalPnL/startBalance)*100).toFixed(1):'0';
+    log(`PnL: $${totalPnL.toFixed(2)} (${roi}%) | Hold:$${hi.toFixed(0)} Rank:$${ri.toFixed(0)} Bet:$${bi.toFixed(0)} USDT:$${freeUSDT.toFixed(2)}`);
+
+  } catch(e) { log(`Erro: ${e.message}`); }
+  running=false;
 }
 
 // ── HTTP SERVER ───────────────────────────────────────
-const server = http.createServer(async(req,res)=>{
+http.createServer(async(req,res)=>{
   res.setHeader('Content-Type','application/json');
   if (req.url==='/pause')  { paused=true;  return res.end(JSON.stringify({paused:true})); }
   if (req.url==='/resume') { paused=false; return res.end(JSON.stringify({paused:false})); }
-
-  const hi = Object.values(holdPos).reduce((s,p)=>s+(p?.usdt||0),0);
-  const ri = Object.values(rankPos).reduce((s,p)=>s+(p?.usdt||0),0);
+  if (req.url==='/rebalance') {
+    for (const [r,p] of Object.entries(rankPos)) { if(p){await sell(p.symbol,p,'Rebalance');rankPos[r]=null;} }
+    await fetchBalance();
+    return res.end(JSON.stringify({ok:true,freeUSDT}));
+  }
+  const roi=startBalance>0?((totalPnL/startBalance)*100).toFixed(1):'0';
   res.end(JSON.stringify({
-    status: 'online',
-    mode:   PAPER_MODE?'simulado':'real',
+    status:'online', mode:PAPER_MODE?'sim':'real',
     paused, lastCycle, tradeCount,
-    pnl:    `$${totalPnL.toFixed(2)}`,
-    roi:    startBalance>0?`${((totalPnL/startBalance)*100).toFixed(1)}%`:'0%',
-    rateLimited: Date.now()<rateLimitUntil,
-    capital: {
-      total:   `$${totalBalance.toFixed(2)}`,
-      freeUSDT:`$${freeUSDT.toFixed(2)}`,
-      hold:    `$${hi.toFixed(2)} (30%)`,
-      ranked:  `$${ri.toFixed(2)} (70%)`,
-      bet:     `$${(betPos?.usdt||0).toFixed(2)} (10%)`,
-    },
-    positions: {
-      hold:   holdPos,
-      rank1:  rankPos[1]||null,
-      rank2:  rankPos[2]||null,
-      rank3:  rankPos[3]||null,
-      bet:    betPos,
-    }
+    pnl:`$${totalPnL.toFixed(2)}`, roi:`${roi}%`,
+    rateLimited:Date.now()<rateLimitUntil,
+    capital:{total:`$${totalBalance.toFixed(2)}`,freeUSDT:`$${freeUSDT.toFixed(2)}`},
+    positions:{hold:holdPos, rank1:rankPos[1], rank2:rankPos[2], rank3:rankPos[3], bet:betPos}
   }));
-});
-
-// ── START ─────────────────────────────────────────────
-server.listen(PORT, async()=>{
-  log(`capital. Bot v14 | ${PAPER_MODE?'SIM':'REAL'} | ${CYCLE_MS/1000}s`);
-  log(`30% Hold | 40% #1 | 20% #2 | 10% #3 | 10% Aposta 7d`);
-
-  // Wait for any existing rate limit to expire
-  await new Promise(r=>setTimeout(r,5000));
-
+}).listen(PORT, async()=>{
+  log(`capital. Bot v15 | ${PAPER_MODE?'SIM':'REAL'}`);
+  log(`Ciclo: ${CYCLE_MS/60000} min | 30% Hold | 40/20/10% Momentum | 10% Bet 7d`);
+  await new Promise(r=>setTimeout(r,3000));
   await fetchBalance();
-  startBalance = totalBalance;
-  log(`Capital inicial: $${startBalance.toFixed(2)}`);
-
-  await notify('capital. 🚀 Bot v14!',
-    `Capital: $${startBalance.toFixed(2)}\n30% Hold | 40+20+10% Hot coins | 10% Aposta 7d`);
-
+  startBalance=totalBalance;
+  log(`Capital: $${startBalance.toFixed(2)}`);
+  await notify('capital. 🚀 Bot v15!',`Capital: $${startBalance.toFixed(2)}\nAnálise a cada 5min`);
   setInterval(runBot, CYCLE_MS);
   runBot();
 });
