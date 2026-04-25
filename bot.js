@@ -475,6 +475,38 @@ http.createServer(async(req,res)=>{
     await fetchBalance();
     return res.end(JSON.stringify({ok:true,freeUSDT}));
   }
+
+  // Sync existing Binance positions into bot tracking
+  if (req.url==='/sync') {
+    holdPos={}; rankPos={1:null,2:null,3:null}; betPos=null;
+    const d=await apiGet(`${BASE}/api/v3/account?${sign()}`,H);
+    if (d) {
+      const prices={};
+      const tickers=await apiGet(`${BASE}/api/v3/ticker/price`);
+      if (tickers) for (const t of tickers) prices[t.symbol]=parseFloat(t.price);
+      const holdAssets=new Set(HOLD_COINS.map(s=>s.replace('USDT','')));
+      let rankIdx=1;
+      for (const b of d.balances) {
+        const qty=parseFloat(b.free)+parseFloat(b.locked);
+        if (qty<=0) continue;
+        if (['USDT','BRL','EUR','GBP','BUSD','USDC'].includes(b.asset)) continue;
+        const sym=b.asset+'USDT';
+        const price=prices[sym]||0;
+        if (!price||qty*price<1) continue;
+        const pos={symbol:sym,entryPrice:price,qty,usdt:qty*price,ts:Date.now(),tag:'SYNC',peak:price};
+        if (holdAssets.has(b.asset)) {
+          holdPos[sym]=pos;
+          log(`[SYNC] Hold: ${sym} $${(qty*price).toFixed(2)}`);
+        } else if (rankIdx<=3) {
+          rankPos[rankIdx]=pos;
+          log(`[SYNC] Rank${rankIdx}: ${sym} $${(qty*price).toFixed(2)}`);
+          rankIdx++;
+        }
+      }
+      await fetchBalance();
+    }
+    return res.end(JSON.stringify({ok:true,holdPos,rankPos,betPos,freeUSDT}));
+  }
   const roi=startBalance>0?((totalPnL/startBalance)*100).toFixed(1):'0';
   res.end(JSON.stringify({
     status:'online', mode:PAPER_MODE?'sim':'real',
