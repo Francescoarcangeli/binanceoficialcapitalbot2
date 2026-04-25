@@ -301,19 +301,26 @@ async function sell(symbol, pos, reason) {
 // ── FREE CAPITAL ──────────────────────────────────────
 async function freeCapital() {
   if (freeUSDT>=MIN_TRADE*2) return;
-  // Sell worst ranked position
-  let worst=null, worstPct=Infinity, worstRank=null;
+  log(`Sem capital ($${freeUSDT.toFixed(2)}) — vendendo pior posição...`);
+
+  // Rank all positions by performance (worst first)
+  const all=[];
   for (const [rank,pos] of Object.entries(rankPos)) {
     if (!pos) continue;
-    if (Date.now()-pos.ts<MIN_HOLD_MS) continue;
     const price=await getPrice(pos.symbol);
     if (!price) continue;
     const pct=((price-pos.entryPrice)/pos.entryPrice)*100;
-    if (pct<worstPct) { worstPct=pct; worst=pos; worstRank=rank; }
+    all.push({rank,pos,pct});
   }
-  if (worst) {
-    const ok=await sell(worst.symbol,worst,`Liberando capital (${worstPct.toFixed(2)}%)`);
-    if (ok) rankPos[worstRank]=null;
+  all.sort((a,b)=>a.pct-b.pct);
+
+  // Try to sell worst until we have capital
+  for (const item of all) {
+    if (freeUSDT>=MIN_TRADE*2) break;
+    log(`Vendendo rank ${item.rank} ${item.pos.symbol} (${item.pct.toFixed(2)}%)`);
+    const ok=await sell(item.pos.symbol,item.pos,`Liberando capital`);
+    if (ok) { rankPos[item.rank]=null; await fetchBalance(); }
+    await new Promise(r=>setTimeout(r,500));
   }
 }
 
